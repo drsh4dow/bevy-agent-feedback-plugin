@@ -21,6 +21,10 @@ log = { version = "*", features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+bevy = { version = "0.19.0", default-features = false, features = ["3d", "ui"] }
+rand = "0.10.0"
+
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]
 opt-level = 1
