@@ -88,8 +88,8 @@ enum AgentCommand {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct CaptureInfo {
-    pub sequence: u64,
-    pub path: String,
+    sequence: u64,
+    path: String,
 }
 
 #[derive(Resource)]
@@ -132,7 +132,7 @@ struct AgentRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AgentRequestBody {
+struct AgentRequestBody {
     id: Value,
     command: AgentCommand,
 }
@@ -400,21 +400,21 @@ fn write_response(stream: &mut TcpStream, response: &AgentResponse) -> io::Resul
 }
 
 fn tick_pending_waits(mut state: ResMut<AgentFeedbackState>) {
-    let mut waits = VecDeque::with_capacity(state.pending_waits.len());
-    while let Some(mut wait) = state.pending_waits.pop_front() {
+    let latest_capture = state.latest_capture.clone();
+    state.pending_waits.retain_mut(|wait| {
         wait.frames_left -= 1;
-        if wait.frames_left == 0 {
-            let _ = wait.responder.send(AgentResponse::ok(
-                wait.id,
-                "waited",
-                state.latest_capture.clone(),
-                None,
-            ));
-        } else {
-            waits.push_back(wait);
+        if wait.frames_left > 0 {
+            return true;
         }
-    }
-    state.pending_waits = waits;
+
+        let _ = wait.responder.send(AgentResponse::ok(
+            wait.id.clone(),
+            "waited",
+            latest_capture.clone(),
+            None,
+        ));
+        false
+    });
 }
 
 fn drain_agent_requests(

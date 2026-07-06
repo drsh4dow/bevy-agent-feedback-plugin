@@ -10,5 +10,5 @@ export AGENT_FEEDBACK_ARTIFACT_ROOT="${AGENT_FEEDBACK_ARTIFACT_ROOT:-target/agen
 mkdir -p "${AGENT_FEEDBACK_ARTIFACT_ROOT}"
 echo "agent feedback artifacts: ${AGENT_FEEDBACK_ARTIFACT_ROOT}"
 
-cargo test --test alien_cake_addict -- --ignored --test-threads=1 --nocapture
-cargo test --test physics_in_fixed_timestep -- --ignored --test-threads=1 --nocapture
+cargo test --test update_input -- --ignored --test-threads=1 --nocapture
+cargo test --test fixed_timestep_input -- --ignored --test-threads=1 --nocapture

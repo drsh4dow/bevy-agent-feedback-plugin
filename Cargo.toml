@@ -14,7 +14,7 @@ bevy = { version = "0.19.0", default-features = false, features = [
   "std",
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-log = { version = "*", features = [
+log = { version = "0.4", features = [
   "max_level_debug",
   "release_max_level_warn",
 ] }
@@ -23,7 +23,6 @@ serde_json = "1"
 
 [dev-dependencies]
 bevy = { version = "0.19.0", default-features = false, features = ["3d", "ui"] }
-rand = "0.10.0"
 
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]
