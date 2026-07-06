@@ -2,7 +2,7 @@
 
 Local agent feedback for Bevy apps.
 
-This crate lets Pi/Codex drive a running Bevy app through a small JSON-lines TCP protocol. An agent can press keys, press mouse buttons, wait for frames, and capture the primary window as PNGs.
+This crate lets Pi/Codex drive a running Bevy app through a small JSON-lines TCP protocol. An agent can press keys, move/click/drag/scroll the mouse, submit text and file-drop events, query primary-window coordinates, wait for frames, and capture the primary window as PNGs.
 
 ## Quick Start
 
@@ -38,10 +38,12 @@ Use port `0` for examples and tests. The plugin writes the chosen socket address
 Example request sequence:
 
 ```jsonl
-{"id":1,"command":"key_down","key":"KeyW"}
-{"id":2,"command":"wait","frames":30}
-{"id":3,"command":"capture"}
-{"id":4,"command":"key_up","key":"KeyW"}
+{"id":1,"command":"window_info"}
+{"id":2,"command":"cursor_move","x":320,"y":240}
+{"id":3,"command":"mouse_down","button":"Left"}
+{"id":4,"command":"wait","frames":3}
+{"id":5,"command":"mouse_up","button":"Left"}
+{"id":6,"command":"capture"}
 ```
 
 Supported commands:
@@ -52,10 +54,18 @@ Supported commands:
 | `key_up` | `key`, for example `"KeyW"` |
 | `mouse_down` | `button`, for example `"Left"` |
 | `mouse_up` | `button`, for example `"Left"` |
+| `cursor_move` | `x`, `y` in logical primary-window pixels |
+| `mouse_motion` | `dx`, `dy` raw motion delta |
+| `mouse_scroll` | `y`, optional `x`, optional `unit` (`"Line"` or `"Pixel"`) |
+| `text` | `value`, committed through Bevy `Ime` |
+| `file_hover` | `path` |
+| `file_drop` | `path` |
+| `file_cancel` | none |
+| `window_info` | none |
 | `wait` | optional `frames`; defaults to `1` |
 | `capture` | none |
 
-Responses echo `id`, set `ok`, and include either `result` or `error`.
+Valid responses echo `id`, set `ok`, and include either `result` or `error`; malformed requests may return `id: null`. Window-aware responses include logical size, physical size, scale factor, and cursor position so agents can convert between screenshots and Bevy logical coordinates. Keyboard commands target physical `KeyCode` input; apps should read `ButtonInput<KeyCode>` or `KeyboardInput.key_code`. Compose click as `cursor_move`, `mouse_down`, `wait` 1 frame, `mouse_up`; compose drag by inserting more `cursor_move` steps before `mouse_up`.
 
 ## Examples
 
