@@ -6,6 +6,7 @@ description = "Bevy plugin for Pi/Codex-driven input and screenshot feedback."
 readme = "README.md"
 keywords = ["bevy", "agent", "automation", "testing"]
 categories = ["development-tools::testing", "game-development"]
+license = "MIT"
 
 [dependencies]
 bevy = { version = "0.19.0", default-features = false, features = [
