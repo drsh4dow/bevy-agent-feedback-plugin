@@ -1,3 +1,62 @@
+//! Agent-friendly input and screenshot control for Bevy apps.
+//!
+//! `bevy-agent-feedback-plugin` opens a local JSON-lines TCP socket that lets an
+//! external Pi/Codex agent press keys, press mouse buttons, wait for rendered
+//! frames, and capture the primary window. The plugin writes a protocol file
+//! with the actual socket address so agents can discover a running app without
+//! hard-coded ports.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use bevy::prelude::*;
+//! use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin};
+//! use std::{net::SocketAddr, path::PathBuf};
+//!
+//! App::new()
+//!     .add_plugins(DefaultPlugins)
+//!     .add_plugins(AgentFeedbackPlugin::new(AgentFeedbackConfig {
+//!         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+//!         protocol_file: PathBuf::from("target/agent-feedback/agent-feedback.json"),
+//!         capture_dir: PathBuf::from("target/agent-feedback/captures"),
+//!         ..Default::default()
+//!     }))
+//!     .run();
+//! ```
+//!
+//! After startup, read the configured protocol file. It contains `socket_addr`,
+//! the capture directory, supported commands, and example JSON requests. Send one
+//! newline-terminated JSON object per request.
+//!
+//! # Protocol
+//!
+//! Requests have an `id` field and a `command` field. Responses echo the `id`,
+//! set `ok`, and include either `result` or `error`.
+//!
+//! Supported commands are `key_down`, `key_up`, `mouse_down`, `mouse_up`,
+//! `wait`, and `capture`. `key` values use Bevy's `KeyCode` serialization, for
+//! example `"KeyW"`. Mouse buttons use Bevy's `MouseButton` serialization, for
+//! example `"Left"`.
+//!
+//! # Scheduling
+//!
+//! Agent commands are drained in `PreUpdate` after Bevy's input systems. Normal
+//! `Update` systems can read the injected `ButtonInput<KeyCode>` and
+//! `ButtonInput<MouseButton>` state.
+//!
+//! # Limits
+//!
+//! Queues, wait durations, request line length, captures, and command response
+//! time are bounded by [`AgentFeedbackConfig`]. Keep the default localhost bind
+//! address unless the control socket is protected from untrusted clients.
+//!
+//! # Examples
+//!
+//! See the `examples/` directory for a minimal instrumented app and a
+//! self-driving demo that uses the same protocol a Pi/Codex agent would use.
+
+#![warn(missing_docs, rustdoc::broken_intra_doc_links)]
+
 use bevy::prelude::*;
 use bevy::render::view::window::screenshot::{Screenshot, ScreenshotCaptured};
 use serde::{Deserialize, Serialize};
@@ -17,14 +76,36 @@ use std::{
     time::Duration,
 };
 
+/// Runtime configuration for [`AgentFeedbackPlugin`].
+///
+/// Defaults bind to localhost on port `15712`, write `agent-feedback.json`, and
+/// keep captures in `agent-feedback-captures`.
 #[derive(Clone, Debug, Resource)]
 pub struct AgentFeedbackConfig {
+    /// TCP address used by the local JSON-lines control socket.
+    ///
+    /// Use port `0` to let the operating system choose a free port. The chosen
+    /// address is written to [`protocol_file`](Self::protocol_file).
     pub bind_addr: SocketAddr,
+
+    /// JSON file written at startup so Pi/Codex agents can discover the socket.
     pub protocol_file: PathBuf,
+
+    /// Directory where `capture` commands write PNG screenshots.
     pub capture_dir: PathBuf,
+
+    /// Maximum queued agent commands drained per frame.
     pub max_pending_commands: usize,
+
+    /// Maximum accepted frame count for a single `wait` command.
     pub max_wait_frames: u16,
+
+    /// Maximum number of retained PNG captures.
+    ///
+    /// Older capture files created by this plugin are removed after this limit.
     pub max_captures: usize,
+
+    /// Maximum time a socket client waits for the game to answer a command.
     pub command_timeout: Duration,
 }
 
@@ -42,12 +123,17 @@ impl Default for AgentFeedbackConfig {
     }
 }
 
+/// Bevy plugin that exposes local agent input and screenshot control.
+///
+/// Add this after the plugins that create input, window, and render resources.
+/// `DefaultPlugins` is the usual choice for rendered examples.
 #[derive(Default)]
 pub struct AgentFeedbackPlugin {
     config: AgentFeedbackConfig,
 }
 
 impl AgentFeedbackPlugin {
+    /// Creates the plugin with explicit runtime configuration.
     pub fn new(config: AgentFeedbackConfig) -> Self {
         Self { config }
     }

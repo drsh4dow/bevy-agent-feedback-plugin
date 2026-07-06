@@ -2,6 +2,10 @@
 name = "bevy-agent-feedback-plugin"
 version = "0.1.0"
 edition = "2024"
+description = "Bevy plugin for Pi/Codex-driven input and screenshot feedback."
+readme = "README.md"
+keywords = ["bevy", "agent", "automation", "testing"]
+categories = ["development-tools::testing", "game-development"]
 
 [dependencies]
 bevy = { version = "0.19.0", default-features = false, features = [
