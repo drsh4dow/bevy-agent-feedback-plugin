@@ -11,7 +11,7 @@ Dev-only: an optional dependency behind a cargo feature. Release builds never co
 
 ```toml
 [dependencies]
-bevy-agent-feedback-plugin = { git = "https://github.com/drsh4dow/bevy-agent-feedback-plugin", optional = true }
+bevy-agent-feedback-plugin = { version = "*", optional = true }
 
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
