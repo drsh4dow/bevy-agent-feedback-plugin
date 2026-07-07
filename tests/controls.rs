@@ -1,4 +1,5 @@
 use bevy::{
+    app::AppExit,
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseWheel},
     prelude::*,
     window::{FileDragAndDrop, Ime, PrimaryWindow},
@@ -14,7 +15,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[test]
@@ -207,6 +208,71 @@ fn release_all_inputs_releases_tracked_inputs() {
 }
 
 #[test]
+fn drag_rejects_out_of_bounds_target_before_pressing_button() {
+    let (mut app, config) = agent_app("drag-target-out-of-bounds");
+    let mut stream = connect(&config);
+
+    let response = send(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"drag","from":[10,10],"to":[999,10],"button":"Left","steps":2,"frames":2}"#,
+    );
+
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert_eq!(response["error"]["code"], "position_out_of_bounds");
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn drag_releases_button_when_move_fails_mid_flight() {
+    let (mut app, config) = agent_app("drag-mid-flight-failure");
+    let mut stream = connect(&config);
+
+    send_raw(
+        &mut stream,
+        r#"{"id":1,"command":"drag","from":[10,10],"to":[600,10],"button":"Left","steps":2,"frames":10}"#,
+    );
+    for _ in 0..20 {
+        app.update();
+        if app
+            .world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        app.world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+    );
+
+    let (_, mut window) = app
+        .world_mut()
+        .query_filtered::<(Entity, &mut Window), With<PrimaryWindow>>()
+        .single_mut(app.world_mut())
+        .expect("primary window");
+    window.resolution.set(100.0, 100.0);
+
+    let response = read_response_while_updating(&mut app, &mut stream);
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert_eq!(response["error"]["code"], "position_out_of_bounds");
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
 fn diagnostics_without_plugin_returns_clear_error() {
     let (mut app, config) = agent_app("diagnostics-unavailable");
     let mut stream = connect(&config);
@@ -324,16 +390,22 @@ fn runtime_drop_removes_live_protocol_files() {
 }
 
 #[test]
-fn rust_client_writes_request_transcript() {
+fn rust_client_writes_transcript_envelopes_and_replays_compat_formats() {
     let (mut app, config) = agent_app("rust-client-transcript");
     let transcript_file = config
         .protocol_file
         .parent()
         .expect("protocol parent")
         .join("transcript.jsonl");
+    let replay_file = config
+        .protocol_file
+        .parent()
+        .expect("protocol parent")
+        .join("replay.jsonl");
     let protocol_file = config.protocol_file.clone();
     let client = thread::spawn({
         let transcript_file = transcript_file.clone();
+        let replay_file = replay_file.clone();
         move || -> Result<(), String> {
             let mut client = AgentClient::with_config(AgentClientConfig {
                 protocol_file,
@@ -342,6 +414,25 @@ fn rust_client_writes_request_transcript() {
             })
             .map_err(|error| error.to_string())?;
             client.window_info().map_err(|error| error.to_string())?;
+            fs::write(
+                &replay_file,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"command": "window_info"}),
+                    serde_json::json!({"request": {"command": "window_info"}}),
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            let responses = client
+                .replay_jsonl(&replay_file)
+                .map_err(|error| error.to_string())?;
+            if responses.len() != 2
+                || responses
+                    .iter()
+                    .any(|response| response["ok"] != Value::Bool(true))
+            {
+                return Err(format!("unexpected replay responses: {responses:?}"));
+            }
             Ok(())
         }
     });
@@ -358,8 +449,131 @@ fn rust_client_writes_request_transcript() {
         .expect("client request");
 
     let transcript = fs::read_to_string(&transcript_file).expect("transcript");
-    assert!(transcript.contains("window_info"));
+    let envelopes = transcript
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("transcript line"))
+        .collect::<Vec<_>>();
+    assert!(envelopes.len() >= 3, "transcript: {transcript}");
+    assert!(envelopes[0]["ts_ms"].as_u64().is_some());
+    assert!(envelopes[0]["duration_ms"].as_u64().is_some());
+    assert_eq!(envelopes[0]["request"]["command"], "window_info");
+    assert_eq!(envelopes[0]["response"]["ok"], Value::Bool(true));
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn rust_client_replay_jsonl_snapshots_transcript_before_appending() {
+    let (mut app, config) = agent_app("rust-client-replay-same-transcript");
+    let transcript_file = config
+        .protocol_file
+        .parent()
+        .expect("protocol parent")
+        .join("transcript.jsonl");
+    fs::write(
+        &transcript_file,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"command": "window_info"}),
+            serde_json::json!({"request": {"command": "window_info"}}),
+        ),
+    )
+    .expect("seed transcript");
+
+    let protocol_file = config.protocol_file.clone();
+    let client = thread::spawn({
+        let transcript_file = transcript_file.clone();
+        move || -> Result<(), String> {
+            let mut client = AgentClient::with_config(AgentClientConfig {
+                protocol_file,
+                timeout: Duration::from_millis(250),
+                transcript_file: Some(transcript_file.clone()),
+                ..Default::default()
+            })
+            .map_err(|error| error.to_string())?;
+            let responses = client
+                .replay_jsonl(&transcript_file)
+                .map_err(|error| error.to_string())?;
+            if responses.len() != 2
+                || responses
+                    .iter()
+                    .any(|response| response["ok"] != Value::Bool(true))
+            {
+                return Err(format!("unexpected replay responses: {responses:?}"));
+            }
+            Ok(())
+        }
+    });
+
+    let finished = update_until(&mut app, Duration::from_secs(2), || client.is_finished());
+    if !finished {
+        drop(app);
+        let _ = client.join();
+        panic!("replay_jsonl should stop after the original transcript lines");
+    }
+    client
+        .join()
+        .expect("client thread")
+        .expect("client replay");
+
+    let transcript = fs::read_to_string(&transcript_file).expect("transcript");
+    let envelopes = transcript
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("transcript line"))
+        .collect::<Vec<_>>();
+    assert_eq!(envelopes.len(), 4, "transcript: {transcript}");
+    assert_eq!(envelopes[0]["command"], "window_info");
+    assert_eq!(envelopes[1]["request"]["command"], "window_info");
+    assert_eq!(envelopes[2]["request"]["command"], "window_info");
+    assert_eq!(envelopes[2]["response"]["ok"], Value::Bool(true));
+    assert_eq!(envelopes[3]["request"]["command"], "window_info");
+    assert_eq!(envelopes[3]["response"]["ok"], Value::Bool(true));
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn idle_shutdown_refreshes_only_after_accepted_commands() {
+    {
+        let (mut app, config) =
+            agent_app_with_idle_shutdown("idle-rejected-command", Duration::from_millis(1));
+        app.insert_resource(ObservedExits::default())
+            .add_systems(Update, observe_app_exit);
+        let mut stream = connect(&config);
+
+        update_for(&mut app, Duration::from_millis(4000));
+        let response = send(
+            &mut app,
+            &mut stream,
+            r#"{"id":1,"command":"cursor_move","x":999,"y":10}"#,
+        );
+        assert_eq!(response["ok"], Value::Bool(false));
+        assert_eq!(response["error"]["code"], "position_out_of_bounds");
+
+        update_for(&mut app, Duration::from_millis(1200));
+        assert!(
+            app.world().resource::<ObservedExits>().count > 0,
+            "rejected commands must not postpone idle shutdown"
+        );
+        let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+    }
+
+    {
+        let (mut app, config) =
+            agent_app_with_idle_shutdown("idle-accepted-command", Duration::from_millis(1));
+        app.insert_resource(ObservedExits::default())
+            .add_systems(Update, observe_app_exit);
+        let mut stream = connect(&config);
+
+        update_for(&mut app, Duration::from_millis(4000));
+        send_ok(&mut app, &mut stream, r#"{"id":1,"command":"window_info"}"#);
+
+        update_for(&mut app, Duration::from_millis(1200));
+        assert_eq!(
+            app.world().resource::<ObservedExits>().count,
+            0,
+            "accepted commands must postpone idle shutdown past the original deadline"
+        );
+        let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+    }
 }
 
 #[derive(Resource, Default)]
@@ -369,6 +583,11 @@ struct ObservedControls {
     scroll_delta: Vec2,
     scroll_y: f32,
     dropped_file: Option<PathBuf>,
+}
+
+#[derive(Resource, Default)]
+struct ObservedExits {
+    count: usize,
 }
 
 fn observe_controls(
@@ -401,12 +620,24 @@ fn observe_controls(
 }
 
 fn agent_app(name: &str) -> (App, AgentFeedbackConfig) {
+    agent_app_with_config(name, None)
+}
+
+fn agent_app_with_idle_shutdown(name: &str, idle_after: Duration) -> (App, AgentFeedbackConfig) {
+    agent_app_with_config(name, Some(idle_after))
+}
+
+fn agent_app_with_config(
+    name: &str,
+    idle_shutdown_after: Option<Duration>,
+) -> (App, AgentFeedbackConfig) {
     let root = temp_root(name);
     let config = AgentFeedbackConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         protocol_file: root.join("agent.json"),
         capture_dir: root.join("captures"),
         command_timeout: Duration::from_secs(2),
+        idle_shutdown_after,
         ..Default::default()
     };
     let mut app = App::new();
@@ -458,6 +689,30 @@ fn connect(config: &AgentFeedbackConfig) -> TcpStream {
     .expect("agent socket should accept local connections");
     stream.set_nonblocking(true).expect("nonblocking stream");
     stream
+}
+
+fn update_for(app: &mut App, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        app.update();
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn update_until(app: &mut App, timeout: Duration, done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        app.update();
+        if done() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    done()
+}
+
+fn observe_app_exit(mut observed: ResMut<ObservedExits>, mut app_exit: MessageReader<AppExit>) {
+    observed.count += app_exit.read().count();
 }
 
 fn send_raw(stream: &mut TcpStream, request: &str) {

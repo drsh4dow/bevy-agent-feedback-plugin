@@ -4,6 +4,45 @@ Local agent feedback for Bevy apps.
 
 This crate lets Pi/Codex drive a running Bevy app through a v2 JSON-lines TCP protocol. Agents can press keys, move/click/drag/scroll the mouse, submit text/file-drop events, query window metadata, wait for frames, capture PNG screenshots, replay transcripts, and shut the app down cleanly.
 
+## Install
+
+```sh
+cargo add bevy-agent-feedback-plugin --optional
+```
+
+```toml
+[features]
+agent = ["dep:bevy-agent-feedback-plugin"]
+```
+
+```rust
+#[cfg(feature = "agent")]
+app.add_plugins(bevy_agent_feedback_plugin::AgentFeedbackPlugin::new(
+    bevy_agent_feedback_plugin::AgentFeedbackConfig {
+        bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
+            .map(Into::into)
+            .unwrap_or_else(|| "target/agent-feedback/agent-feedback.json".into()),
+        capture_dir: std::env::var_os("BEVY_FEEDBACK_CAPTURE_DIR")
+            .map(Into::into)
+            .unwrap_or_else(|| "target/agent-feedback/captures".into()),
+        ..Default::default()
+    },
+));
+```
+
+Install the wrapper binary (`bevy-feedback`):
+
+```sh
+cargo install bevy-agent-feedback-plugin
+```
+
+Dev form from this repo:
+
+```sh
+cargo run --bin bevy-feedback -- run -- cargo run --example minimal
+```
+
 ## Quick Start
 
 ```rust
@@ -26,6 +65,16 @@ fn main() {
 
 Use port `0` for examples and tests. The plugin writes a self-describing protocol file with the chosen socket, session heartbeat, capture directory, commands, and examples.
 
+For deterministic captures, pin the window size and scale factor:
+
+```rust
+Window {
+    resolution: bevy::window::WindowResolution::new(1280, 720)
+        .with_scale_factor_override(1.0),
+    ..default()
+}
+```
+
 ## Drive it
 
 ```sh
@@ -40,7 +89,7 @@ cargo run --bin bevy-feedback -- run \
   --driver python3 my_driver.py
 ```
 
-The wrapper exports the protocol/capture/artifact paths, waits for readiness, streams logs, releases inputs, sends `shutdown`, and writes artifacts.
+The wrapper exports the protocol/capture/artifact paths, waits for readiness, streams logs, releases inputs, sends `shutdown`, and writes artifacts including a replayable JSONL transcript with responses/timing.
 
 Raw JSON-lines also works:
 
@@ -55,12 +104,31 @@ Raw JSON-lines also works:
 
 Rust: `bevy_agent_feedback_plugin::client::AgentClient`.
 Python: `clients/python/bevy_feedback.py`; `skills/driving-bevy-games/drive.py` remains a compatibility wrapper.
+TypeScript: `clients/typescript/bevy_feedback.ts`, dependency-free (`node` with type stripping or `tsx`).
 
-Both clients can replay transcripts, release held inputs on close, and run optional OCR assertions through the system `tesseract` CLI.
+Rust/Python clients include pixel/OCR assertions. TypeScript v1 covers core driving only. All clients can replay transcript v1 envelopes (`request` + `response` + timing) and older request-only JSONL, and release held inputs on close. See [`skills/driving-bevy-games/SKILL.md`](skills/driving-bevy-games/SKILL.md) for driver workflow details.
+
+```ts
+import { BevyFeedbackClient } from "./clients/typescript/bevy_feedback.ts";
+
+const game = new BevyFeedbackClient();
+console.log(await game.windowInfo());
+await game.close();
+```
 
 ## Optional diagnostics
 
-Enable the `diagnostics` feature and add `AgentFeedbackDiagnosticsPlugin` for `ecs_summary`, `list_entities`, `camera_info`, and registered `state_info` commands.
+Enable the `diagnostics` feature and add `AgentFeedbackDiagnosticsPlugin` for `ecs_summary`, `list_entities`, `camera_info`, registered `state_info`, and registered marker-component `marker_info` commands.
+
+```rust
+#[derive(Component)]
+struct Selectable;
+
+app.add_plugins(
+    bevy_agent_feedback_plugin::AgentFeedbackDiagnosticsPlugin::default()
+        .with_marker::<Selectable>(),
+);
+```
 
 ## CI
 

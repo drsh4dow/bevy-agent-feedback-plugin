@@ -51,6 +51,7 @@ impl Plugin for AgentFeedbackControlPlugin {
                     tick_pending_actions,
                     tick_pending_waits,
                     drain_agent_requests,
+                    crate::runtime::idle_shutdown,
                 )
                     .chain()
                     .before(bevy::input::InputSystems),
@@ -199,7 +200,7 @@ fn tick_pending_waits(mut state: ResMut<AgentFeedbackState>) {
 #[allow(clippy::too_many_arguments)]
 fn drain_agent_requests(
     mut commands: Commands,
-    runtime: Option<Res<AgentFeedbackRuntime>>,
+    runtime: Option<ResMut<AgentFeedbackRuntime>>,
     config: Res<AgentFeedbackConfig>,
     mut state: ResMut<AgentFeedbackState>,
     mut windows: Query<(Entity, &mut Window), With<PrimaryWindow>>,
@@ -216,7 +217,7 @@ fn drain_agent_requests(
         ResMut<crate::diagnostics::AgentDiagnosticsQueue>,
     >,
 ) {
-    let Some(runtime) = runtime else {
+    let Some(mut runtime) = runtime else {
         return;
     };
     let command_limit = config.max_pending_commands.max(1);
@@ -243,7 +244,7 @@ fn drain_agent_requests(
             command,
             responder,
         } = request;
-        match command {
+        let accepted = match command {
             AgentCommand::KeyDown(key) => {
                 match write_keyboard(
                     &mut windows,
@@ -252,8 +253,14 @@ fn drain_agent_requests(
                     ButtonState::Pressed,
                     &mut state,
                 ) {
-                    Ok(info) => ok_with_window(responder, id, &state, info),
-                    Err(()) => missing_window(responder, id),
+                    Ok(info) => {
+                        ok_with_window(responder, id, &state, info);
+                        true
+                    }
+                    Err(()) => {
+                        missing_window(responder, id);
+                        false
+                    }
                 }
             }
             AgentCommand::KeyUp(key) => match write_keyboard(
@@ -263,8 +270,14 @@ fn drain_agent_requests(
                 ButtonState::Released,
                 &mut state,
             ) {
-                Ok(info) => ok_with_window(responder, id, &state, info),
-                Err(()) => missing_window(responder, id),
+                Ok(info) => {
+                    ok_with_window(responder, id, &state, info);
+                    true
+                }
+                Err(()) => {
+                    missing_window(responder, id);
+                    false
+                }
             },
             AgentCommand::MouseDown(button) => match write_mouse_button(
                 &mut windows,
@@ -273,8 +286,14 @@ fn drain_agent_requests(
                 ButtonState::Pressed,
                 &mut state,
             ) {
-                Ok(info) => ok_with_window(responder, id, &state, info),
-                Err(()) => missing_window(responder, id),
+                Ok(info) => {
+                    ok_with_window(responder, id, &state, info);
+                    true
+                }
+                Err(()) => {
+                    missing_window(responder, id);
+                    false
+                }
             },
             AgentCommand::MouseUp(button) => match write_mouse_button(
                 &mut windows,
@@ -283,91 +302,102 @@ fn drain_agent_requests(
                 ButtonState::Released,
                 &mut state,
             ) {
-                Ok(info) => ok_with_window(responder, id, &state, info),
-                Err(()) => missing_window(responder, id),
+                Ok(info) => {
+                    ok_with_window(responder, id, &state, info);
+                    true
+                }
+                Err(()) => {
+                    missing_window(responder, id);
+                    false
+                }
             },
-            AgentCommand::CursorMove { position } => {
-                move_cursor(
-                    &mut windows,
-                    &mut cursor_moved,
-                    responder,
-                    id,
-                    &state,
-                    position,
-                );
-            }
+            AgentCommand::CursorMove { position } => move_cursor(
+                &mut windows,
+                &mut cursor_moved,
+                responder,
+                id,
+                &state,
+                position,
+            ),
             AgentCommand::MouseMotion { delta } => {
                 mouse_motion.write(MouseMotion { delta });
                 if let Some(accumulated) = accumulated_mouse_motion.as_deref_mut() {
                     accumulated.delta += delta;
                 }
                 ok(responder, id, &state);
+                true
             }
-            AgentCommand::MouseScroll { delta, unit } => {
-                let Ok((window, info)) = primary_window_info(&mut windows) else {
-                    missing_window(responder, id);
-                    continue;
-                };
-                mouse_wheel.write(MouseWheel {
-                    unit,
-                    x: delta.x,
-                    y: delta.y,
-                    window,
-                    phase: TouchPhase::Moved,
-                });
-                if let Some(accumulated) = accumulated_mouse_scroll.as_deref_mut() {
-                    accumulated.unit = unit;
-                    accumulated.delta += delta;
+            AgentCommand::MouseScroll { delta, unit } => match primary_window_info(&mut windows) {
+                Ok((window, info)) => {
+                    mouse_wheel.write(MouseWheel {
+                        unit,
+                        x: delta.x,
+                        y: delta.y,
+                        window,
+                        phase: TouchPhase::Moved,
+                    });
+                    if let Some(accumulated) = accumulated_mouse_scroll.as_deref_mut() {
+                        accumulated.unit = unit;
+                        accumulated.delta += delta;
+                    }
+                    ok_with_window(responder, id, &state, info);
+                    true
                 }
-                ok_with_window(responder, id, &state, info);
-            }
-            AgentCommand::Text { value } => {
-                let Ok((window, info)) = primary_window_info(&mut windows) else {
+                Err(()) => {
                     missing_window(responder, id);
-                    continue;
-                };
-                ime.write(Ime::Commit { window, value });
-                ok_with_window(responder, id, &state, info);
-            }
-            AgentCommand::FileHover { path } => {
-                write_file_drag_drop(
-                    &mut windows,
-                    &mut file_drag_drop,
-                    responder,
-                    id,
-                    &state,
-                    |window| FileDragAndDrop::HoveredFile {
-                        window,
-                        path_buf: path,
-                    },
-                );
-            }
-            AgentCommand::FileDrop { path } => {
-                write_file_drag_drop(
-                    &mut windows,
-                    &mut file_drag_drop,
-                    responder,
-                    id,
-                    &state,
-                    |window| FileDragAndDrop::DroppedFile {
-                        window,
-                        path_buf: path,
-                    },
-                );
-            }
-            AgentCommand::FileCancel => {
-                write_file_drag_drop(
-                    &mut windows,
-                    &mut file_drag_drop,
-                    responder,
-                    id,
-                    &state,
-                    |window| FileDragAndDrop::HoveredFileCanceled { window },
-                );
-            }
+                    false
+                }
+            },
+            AgentCommand::Text { value } => match primary_window_info(&mut windows) {
+                Ok((window, info)) => {
+                    ime.write(Ime::Commit { window, value });
+                    ok_with_window(responder, id, &state, info);
+                    true
+                }
+                Err(()) => {
+                    missing_window(responder, id);
+                    false
+                }
+            },
+            AgentCommand::FileHover { path } => write_file_drag_drop(
+                &mut windows,
+                &mut file_drag_drop,
+                responder,
+                id,
+                &state,
+                |window| FileDragAndDrop::HoveredFile {
+                    window,
+                    path_buf: path,
+                },
+            ),
+            AgentCommand::FileDrop { path } => write_file_drag_drop(
+                &mut windows,
+                &mut file_drag_drop,
+                responder,
+                id,
+                &state,
+                |window| FileDragAndDrop::DroppedFile {
+                    window,
+                    path_buf: path,
+                },
+            ),
+            AgentCommand::FileCancel => write_file_drag_drop(
+                &mut windows,
+                &mut file_drag_drop,
+                responder,
+                id,
+                &state,
+                |window| FileDragAndDrop::HoveredFileCanceled { window },
+            ),
             AgentCommand::WindowInfo => match primary_window_info(&mut windows) {
-                Ok((_, info)) => ok_with_window(responder, id, &state, info),
-                Err(()) => missing_window(responder, id),
+                Ok((_, info)) => {
+                    ok_with_window(responder, id, &state, info);
+                    true
+                }
+                Err(()) => {
+                    missing_window(responder, id);
+                    false
+                }
             },
             AgentCommand::Wait { frames } => {
                 if state.pending_waits.len() >= command_limit {
@@ -376,12 +406,14 @@ fn drain_agent_requests(
                         "queue_full",
                         "too many pending wait commands",
                     ));
+                    false
                 } else {
                     state.pending_waits.push_back(PendingWait {
                         id,
                         frames_left: frames,
                         responder,
                     });
+                    true
                 }
             }
             AgentCommand::Capture => capture_primary_window(
@@ -398,8 +430,14 @@ fn drain_agent_requests(
                 &mut mouse_button_input,
                 &mut state,
             ) {
-                Ok(info) => ok_with_window(responder, id, &state, info),
-                Err(()) => missing_window(responder, id),
+                Ok(info) => {
+                    ok_with_window(responder, id, &state, info);
+                    true
+                }
+                Err(()) => {
+                    missing_window(responder, id);
+                    false
+                }
             },
             AgentCommand::Shutdown => {
                 let window = release_all_inputs_internal(
@@ -414,6 +452,7 @@ fn drain_agent_requests(
                     None => ok(responder, id, &state),
                 }
                 commands.write_message(AppExit::Success);
+                true
             }
             AgentCommand::Click {
                 position,
@@ -422,27 +461,34 @@ fn drain_agent_requests(
             } => {
                 if state.pending_actions.len() >= command_limit {
                     queue_full(responder, id, "too many pending actions");
-                    continue;
-                }
-                if let Err(error) = move_cursor_internal(&mut windows, &mut cursor_moved, position)
+                    false
+                } else if let Err(error) =
+                    move_cursor_internal(&mut windows, &mut cursor_moved, position)
                 {
                     let _ = responder.send(error_response(id, error));
-                    continue;
-                }
-                match write_mouse_button(
-                    &mut windows,
-                    &mut mouse_button_input,
-                    button,
-                    ButtonState::Pressed,
-                    &mut state,
-                ) {
-                    Ok(_) => state.pending_actions.push_back(PendingAction {
-                        id,
-                        frames_left: frames,
-                        responder,
-                        kind: PendingActionKind::ReleaseButton(button),
-                    }),
-                    Err(()) => missing_window(responder, id),
+                    false
+                } else {
+                    match write_mouse_button(
+                        &mut windows,
+                        &mut mouse_button_input,
+                        button,
+                        ButtonState::Pressed,
+                        &mut state,
+                    ) {
+                        Ok(_) => {
+                            state.pending_actions.push_back(PendingAction {
+                                id,
+                                frames_left: frames,
+                                responder,
+                                kind: PendingActionKind::ReleaseButton(button),
+                            });
+                            true
+                        }
+                        Err(()) => {
+                            missing_window(responder, id);
+                            false
+                        }
+                    }
                 }
             }
             AgentCommand::Drag {
@@ -454,60 +500,79 @@ fn drain_agent_requests(
             } => {
                 if state.pending_actions.len() >= command_limit {
                     queue_full(responder, id, "too many pending actions");
-                    continue;
-                }
-                if let Err(error) = move_cursor_internal(&mut windows, &mut cursor_moved, from) {
+                    false
+                } else if let Err(error) = validate_cursor_position(&mut windows, to) {
                     let _ = responder.send(error_response(id, error));
-                    continue;
-                }
-                match write_mouse_button(
-                    &mut windows,
-                    &mut mouse_button_input,
-                    button,
-                    ButtonState::Pressed,
-                    &mut state,
-                ) {
-                    Ok(_) => state.pending_actions.push_back(PendingAction {
-                        id,
-                        frames_left: frames,
-                        responder,
-                        kind: PendingActionKind::Drag {
-                            from,
-                            to,
-                            button,
-                            total_frames: frames,
-                            steps,
-                            last_step: 0,
-                        },
-                    }),
-                    Err(()) => missing_window(responder, id),
+                    false
+                } else if let Err(error) =
+                    move_cursor_internal(&mut windows, &mut cursor_moved, from)
+                {
+                    let _ = responder.send(error_response(id, error));
+                    false
+                } else {
+                    match write_mouse_button(
+                        &mut windows,
+                        &mut mouse_button_input,
+                        button,
+                        ButtonState::Pressed,
+                        &mut state,
+                    ) {
+                        Ok(_) => {
+                            state.pending_actions.push_back(PendingAction {
+                                id,
+                                frames_left: frames,
+                                responder,
+                                kind: PendingActionKind::Drag {
+                                    from,
+                                    to,
+                                    button,
+                                    total_frames: frames,
+                                    steps,
+                                    last_step: 0,
+                                },
+                            });
+                            true
+                        }
+                        Err(()) => {
+                            missing_window(responder, id);
+                            false
+                        }
+                    }
                 }
             }
             AgentCommand::KeyHold { key, frames } => {
                 if state.pending_actions.len() >= command_limit {
                     queue_full(responder, id, "too many pending actions");
-                    continue;
-                }
-                match write_keyboard(
-                    &mut windows,
-                    &mut keyboard_input,
-                    key,
-                    ButtonState::Pressed,
-                    &mut state,
-                ) {
-                    Ok(_) => state.pending_actions.push_back(PendingAction {
-                        id,
-                        frames_left: frames,
-                        responder,
-                        kind: PendingActionKind::ReleaseKey(key),
-                    }),
-                    Err(()) => missing_window(responder, id),
+                    false
+                } else {
+                    match write_keyboard(
+                        &mut windows,
+                        &mut keyboard_input,
+                        key,
+                        ButtonState::Pressed,
+                        &mut state,
+                    ) {
+                        Ok(_) => {
+                            state.pending_actions.push_back(PendingAction {
+                                id,
+                                frames_left: frames,
+                                responder,
+                                kind: PendingActionKind::ReleaseKey(key),
+                            });
+                            true
+                        }
+                        Err(()) => {
+                            missing_window(responder, id);
+                            false
+                        }
+                    }
                 }
             }
             AgentCommand::EcsSummary
             | AgentCommand::ListEntities
             | AgentCommand::CameraInfo
-            | AgentCommand::StateInfo => {
+            | AgentCommand::StateInfo
+            | AgentCommand::MarkerInfo => {
                 #[cfg(feature = "diagnostics")]
                 {
                     if let Some(queue) = diagnostics.as_deref_mut() {
@@ -518,14 +583,21 @@ fn drain_agent_requests(
                                 responder,
                             },
                             command_limit,
-                        );
+                        )
                     } else {
                         diagnostics_unavailable(responder, id);
+                        false
                     }
                 }
                 #[cfg(not(feature = "diagnostics"))]
-                diagnostics_unavailable(responder, id);
+                {
+                    diagnostics_unavailable(responder, id);
+                    false
+                }
             }
+        };
+        if accepted {
+            runtime.record_accepted_command();
         }
     }
 }
@@ -587,6 +659,17 @@ fn run_pending_action(
                 let position = from.lerp(*to, t);
                 let move_result = move_cursor_internal(windows, cursor_moved, position);
                 if let Err(error) = move_result {
+                    if write_mouse_button(
+                        windows,
+                        mouse_button_input,
+                        *button,
+                        ButtonState::Released,
+                        state,
+                    )
+                    .is_err()
+                    {
+                        track_button(state, *button, ButtonState::Released);
+                    }
                     let _ = action
                         .responder
                         .send(error_response(action.id.clone(), error));
@@ -765,11 +848,15 @@ fn move_cursor(
     id: Value,
     state: &AgentFeedbackState,
     position: Vec2,
-) {
+) -> bool {
     match move_cursor_internal(windows, writer, position) {
-        Ok(info) => ok_with_window(responder, id, state, info),
+        Ok(info) => {
+            ok_with_window(responder, id, state, info);
+            true
+        }
         Err(error) => {
             let _ = responder.send(error_response(id, error));
+            false
         }
     }
 }
@@ -782,9 +869,7 @@ fn move_cursor_internal(
     let Ok((window_entity, mut window)) = windows.single_mut() else {
         return Err(CommandError::MissingWindow);
     };
-    if !contains_position(&window, position) {
-        return Err(CommandError::PositionOutOfBounds);
-    }
+    validate_position(&window, position)?;
 
     let previous = window.cursor_position();
     window.set_cursor_position(Some(position));
@@ -794,6 +879,24 @@ fn move_cursor_internal(
         delta: previous.map(|previous| position - previous),
     });
     Ok(WindowInfo::from_window(&window))
+}
+
+fn validate_cursor_position(
+    windows: &mut Query<(Entity, &mut Window), With<PrimaryWindow>>,
+    position: Vec2,
+) -> Result<(), CommandError> {
+    let Ok((_, window)) = windows.single_mut() else {
+        return Err(CommandError::MissingWindow);
+    };
+    validate_position(&window, position)
+}
+
+fn validate_position(window: &Window, position: Vec2) -> Result<(), CommandError> {
+    if contains_position(window, position) {
+        Ok(())
+    } else {
+        Err(CommandError::PositionOutOfBounds)
+    }
 }
 
 enum CommandError {
@@ -845,13 +948,14 @@ fn write_file_drag_drop(
     id: Value,
     state: &AgentFeedbackState,
     message: impl FnOnce(Entity) -> FileDragAndDrop,
-) {
+) -> bool {
     let Ok((window, info)) = primary_window_info(windows) else {
         missing_window(responder, id);
-        return;
+        return false;
     };
     writer.write(message(window));
     ok_with_window(responder, id, state, info);
+    true
 }
 
 fn contains_position(window: &Window, position: Vec2) -> bool {
@@ -868,14 +972,14 @@ fn capture_primary_window(
     windows: &mut Query<(Entity, &mut Window), With<PrimaryWindow>>,
     id: Value,
     responder: SyncSender<AgentResponse>,
-) {
+) -> bool {
     if let Err(error) = fs::create_dir_all(&config.capture_dir) {
         let _ = responder.send(AgentResponse::error(
             id,
             "capture_dir",
             format!("failed to create capture directory: {error}"),
         ));
-        return;
+        return false;
     }
 
     let window = primary_window_info(windows).ok().map(|(_, info)| info);
@@ -913,6 +1017,7 @@ fn capture_primary_window(
             let _ = responder.send(response);
         },
     );
+    true
 }
 
 fn save_capture(image: &bevy::image::Image, path: &Path) -> io::Result<()> {

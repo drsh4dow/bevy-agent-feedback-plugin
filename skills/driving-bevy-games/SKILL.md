@@ -55,7 +55,11 @@ Done when the protocol file exists and has `protocol: "bevy-agent-feedback/2"`, 
 
 ## Look → act → look
 
-Use the Python client/wrapper:
+Use the bundled Python client/wrapper.
+
+Reference script URI (after skill installation): `skill://driving-bevy-games/drive.py`.
+
+Runnable checkout path:
 
 ```sh
 python3 skills/driving-bevy-games/drive.py target/agent-feedback/agent-feedback.json <<'EOF'
@@ -72,6 +76,8 @@ Each iteration:
 4. **Look**: capture again and verify pixels changed.
 
 Capture/window responses include frame, game time, window size/scale, mouse position, and agent-held inputs. If behavior fails, inspect artifacts/logs before more input.
+
+Optional diagnostics expose `ecs_summary`, `list_entities`, `camera_info`, `state_info`, and `marker_info` for marker components registered with `AgentFeedbackDiagnosticsPlugin::with_marker::<T>()`.
 
 ## Cleanup
 

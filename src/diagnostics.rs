@@ -10,15 +10,23 @@ const MAX_DIAGNOSTIC_ENTITIES: usize = 256;
 const MAX_DIAGNOSTIC_CAMERAS: usize = 32;
 
 type StateReader = fn(&World) -> Option<Value>;
+type MarkerReader = fn(&mut World) -> (usize, Vec<Entity>);
+
+#[derive(Clone)]
+struct MarkerDiagnostic {
+    name: String,
+    reader: MarkerReader,
+}
 
 /// Optional diagnostics commands for agent debugging.
 ///
 /// Add this next to [`crate::AgentFeedbackPlugin`] and enable the `diagnostics`
-/// Cargo feature to serve `ecs_summary`, `list_entities`, `camera_info`, and
-/// `state_info` commands.
+/// Cargo feature to serve `ecs_summary`, `list_entities`, `camera_info`,
+/// `state_info`, and registered `marker_info` commands.
 #[derive(Default)]
 pub struct AgentFeedbackDiagnosticsPlugin {
     state_readers: Vec<StateReader>,
+    marker_readers: Vec<MarkerDiagnostic>,
 }
 
 impl AgentFeedbackDiagnosticsPlugin {
@@ -28,6 +36,16 @@ impl AgentFeedbackDiagnosticsPlugin {
         self.state_readers.push(read_state::<S>);
         self
     }
+
+    /// Registers a marker component type for the `marker_info` command.
+    #[must_use]
+    pub fn with_marker<T: Component>(mut self) -> Self {
+        self.marker_readers.push(MarkerDiagnostic {
+            name: short_type_name::<T>(),
+            reader: read_marker::<T>,
+        });
+        self
+    }
 }
 
 impl Plugin for AgentFeedbackDiagnosticsPlugin {
@@ -35,6 +53,7 @@ impl Plugin for AgentFeedbackDiagnosticsPlugin {
         app.insert_resource(AgentDiagnosticsQueue {
             requests: VecDeque::new(),
             state_readers: self.state_readers.clone(),
+            marker_readers: self.marker_readers.clone(),
         })
         .add_systems(PreUpdate, answer_diagnostics);
     }
@@ -44,28 +63,31 @@ impl Plugin for AgentFeedbackDiagnosticsPlugin {
 pub(crate) struct AgentDiagnosticsQueue {
     requests: VecDeque<AgentRequest>,
     state_readers: Vec<StateReader>,
+    marker_readers: Vec<MarkerDiagnostic>,
 }
 
 impl AgentDiagnosticsQueue {
-    pub(crate) fn enqueue(&mut self, request: AgentRequest, max_requests: usize) {
+    pub(crate) fn enqueue(&mut self, request: AgentRequest, max_requests: usize) -> bool {
         if self.requests.len() >= max_requests {
             let _ = request.responder.send(AgentResponse::error(
                 request.id,
                 "queue_full",
                 "diagnostics command queue is full",
             ));
-            return;
+            return false;
         }
         self.requests.push_back(request);
+        true
     }
 }
 
 fn answer_diagnostics(world: &mut World) {
-    let (requests, state_readers) = {
+    let (requests, state_readers, marker_readers) = {
         let mut queue = world.resource_mut::<AgentDiagnosticsQueue>();
         (
             queue.requests.drain(..).collect::<Vec<_>>(),
             queue.state_readers.clone(),
+            queue.marker_readers.clone(),
         )
     };
 
@@ -75,6 +97,7 @@ fn answer_diagnostics(world: &mut World) {
             AgentCommand::ListEntities => list_entities(world),
             AgentCommand::CameraInfo => camera_info(world),
             AgentCommand::StateInfo => state_info(world, &state_readers),
+            AgentCommand::MarkerInfo => marker_info(world, &marker_readers),
             _ => json!({"error": "not a diagnostics command"}),
         };
         let _ = request
@@ -160,12 +183,52 @@ fn state_info(world: &World, readers: &[StateReader]) -> Value {
     json!({ "states": states })
 }
 
+fn marker_info(world: &mut World, readers: &[MarkerDiagnostic]) -> Value {
+    let markers = readers
+        .iter()
+        .map(|marker| {
+            let (total, entities) = (marker.reader)(world);
+            json!({
+                "name": marker.name,
+                "count": total,
+                "entities": entities
+                    .iter()
+                    .map(|entity| format!("{entity:?}"))
+                    .collect::<Vec<_>>(),
+                "truncated": total > MAX_DIAGNOSTIC_ENTITIES,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "markers": markers })
+}
+
 fn read_state<S: States>(world: &World) -> Option<Value> {
     let state = world.get_resource::<State<S>>()?;
     Some(json!({
         "type": type_name::<S>(),
         "value": format!("{:?}", state.get()),
     }))
+}
+
+fn read_marker<T: Component>(world: &mut World) -> (usize, Vec<Entity>) {
+    let mut query = world.query_filtered::<Entity, With<T>>();
+    let mut total = 0usize;
+    let mut entities = Vec::new();
+    for entity in query.iter(world) {
+        total += 1;
+        if entities.len() < MAX_DIAGNOSTIC_ENTITIES {
+            entities.push(entity);
+        }
+    }
+    (total, entities)
+}
+
+fn short_type_name<T>() -> String {
+    type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or(type_name::<T>())
+        .to_string()
 }
 
 #[cfg(test)]
@@ -182,5 +245,36 @@ mod tests {
 
         let entities = list_entities(app.world());
         assert!(entities["total"].as_u64().unwrap() >= 1);
+    }
+
+    #[derive(Component)]
+    struct TestMarker;
+
+    #[test]
+    fn marker_info_preserves_total_count_when_entity_list_is_capped() {
+        let mut app = App::new();
+        app.add_plugins(AgentFeedbackDiagnosticsPlugin::default().with_marker::<TestMarker>());
+        for _ in 0..MAX_DIAGNOSTIC_ENTITIES + 1 {
+            app.world_mut().spawn(TestMarker);
+        }
+        app.update();
+
+        let marker_readers = app
+            .world()
+            .resource::<AgentDiagnosticsQueue>()
+            .marker_readers
+            .clone();
+        let result = marker_info(app.world_mut(), &marker_readers);
+        let marker = &result["markers"][0];
+        let count = marker["count"].as_u64().expect("marker count");
+        let entities = marker["entities"].as_array().expect("entities");
+        assert_eq!(marker["name"], "TestMarker");
+        assert_eq!(count, (MAX_DIAGNOSTIC_ENTITIES + 1) as u64);
+        assert_eq!(entities.len(), MAX_DIAGNOSTIC_ENTITIES);
+        assert!(
+            count > entities.len() as u64,
+            "marker_info must keep the full count when capping entity details"
+        );
+        assert_eq!(marker["truncated"], Value::Bool(true));
     }
 }

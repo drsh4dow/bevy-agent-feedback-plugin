@@ -3,7 +3,7 @@ use crate::{
     protocol::{AgentCommand, AgentResponse, parse_request, write_protocol_file},
     session::AgentFeedbackSession,
 };
-use bevy::prelude::*;
+use bevy::{app::AppExit, prelude::*};
 use serde_json::Value;
 use std::{
     io::{self, Read, Write},
@@ -40,10 +40,17 @@ impl Plugin for AgentFeedbackRuntimePlugin {
 pub(crate) struct AgentFeedbackRuntime {
     pub(crate) requests: Mutex<Receiver<AgentRequest>>,
     pub(crate) release_on_disconnect: Arc<AtomicBool>,
+    last_accepted_command: Instant,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
     session: AgentFeedbackSession,
     protocol_file: PathBuf,
+}
+
+impl AgentFeedbackRuntime {
+    pub(crate) fn record_accepted_command(&mut self) {
+        self.last_accepted_command = Instant::now();
+    }
 }
 
 impl Drop for AgentFeedbackRuntime {
@@ -66,6 +73,37 @@ pub(crate) struct AgentRequest {
     pub(crate) responder: SyncSender<AgentResponse>,
 }
 
+struct ServerSettings {
+    command_timeout: Duration,
+    max_wait_frames: u16,
+    max_action_steps: u16,
+    release_on_disconnect: Arc<AtomicBool>,
+}
+
+pub(crate) fn idle_shutdown(
+    config: Res<AgentFeedbackConfig>,
+    runtime: Option<ResMut<AgentFeedbackRuntime>>,
+    mut app_exit: MessageWriter<AppExit>,
+) {
+    let Some(idle_after) = config.idle_shutdown_after else {
+        return;
+    };
+    let Some(mut runtime) = runtime else {
+        return;
+    };
+    let idle_after = idle_after.max(Duration::from_secs(5));
+    if runtime.last_accepted_command.elapsed() < idle_after {
+        return;
+    }
+
+    runtime.last_accepted_command = Instant::now();
+    log::warn!(
+        "agent feedback idle shutdown after {} ms without an accepted command",
+        idle_after.as_millis()
+    );
+    app_exit.write(AppExit::Success);
+}
+
 fn start_runtime(
     config: &AgentFeedbackConfig,
     session: AgentFeedbackSession,
@@ -76,29 +114,23 @@ fn start_runtime(
     let (sender, receiver) = sync_channel(config.max_pending_commands.max(1));
     let running = Arc::new(AtomicBool::new(true));
     let release_on_disconnect = Arc::new(AtomicBool::new(false));
+    let last_accepted_command = Instant::now();
     let server_running = running.clone();
-    let server_release_on_disconnect = release_on_disconnect.clone();
-    let command_timeout = config.command_timeout;
-    let max_wait_frames = config.max_wait_frames;
-    let max_action_steps = config.max_action_steps;
+    let settings = ServerSettings {
+        command_timeout: config.command_timeout,
+        max_wait_frames: config.max_wait_frames,
+        max_action_steps: config.max_action_steps,
+        release_on_disconnect: release_on_disconnect.clone(),
+    };
     let thread = thread::Builder::new()
         .name("bevy-agent-feedback".to_string())
-        .spawn(move || {
-            server_loop(
-                listener,
-                sender,
-                server_running,
-                command_timeout,
-                max_wait_frames,
-                max_action_steps,
-                server_release_on_disconnect,
-            )
-        })?;
+        .spawn(move || server_loop(listener, sender, server_running, settings))?;
 
     Ok((
         AgentFeedbackRuntime {
             requests: Mutex::new(receiver),
             release_on_disconnect,
+            last_accepted_command,
             running,
             thread: Mutex::new(Some(thread)),
             protocol_file: config.protocol_file.clone(),
@@ -112,22 +144,11 @@ fn server_loop(
     listener: TcpListener,
     sender: SyncSender<AgentRequest>,
     running: Arc<AtomicBool>,
-    command_timeout: Duration,
-    max_wait_frames: u16,
-    max_action_steps: u16,
-    release_on_disconnect: Arc<AtomicBool>,
+    settings: ServerSettings,
 ) {
     while running.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _)) => handle_client(
-                stream,
-                &sender,
-                &running,
-                command_timeout,
-                max_wait_frames,
-                max_action_steps,
-                release_on_disconnect.clone(),
-            ),
+            Ok((stream, _)) => handle_client(stream, &sender, &running, &settings),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
             }
@@ -143,13 +164,10 @@ fn handle_client(
     mut stream: TcpStream,
     sender: &SyncSender<AgentRequest>,
     running: &AtomicBool,
-    command_timeout: Duration,
-    max_wait_frames: u16,
-    max_action_steps: u16,
-    release_on_disconnect: Arc<AtomicBool>,
+    settings: &ServerSettings,
 ) {
     let _release_guard = DisconnectReleaseGuard {
-        release_on_disconnect,
+        release_on_disconnect: settings.release_on_disconnect.clone(),
     };
     if stream
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -157,7 +175,10 @@ fn handle_client(
     {
         return;
     }
-    if stream.set_write_timeout(Some(command_timeout)).is_err() {
+    if stream
+        .set_write_timeout(Some(settings.command_timeout))
+        .is_err()
+    {
         return;
     }
 
@@ -183,16 +204,7 @@ fn handle_client(
                     let line: Vec<u8> = pending.drain(..=newline).collect();
                     let line = String::from_utf8_lossy(&line);
                     let line = line.trim();
-                    if !line.is_empty()
-                        && handle_line(
-                            line,
-                            &mut stream,
-                            sender,
-                            command_timeout,
-                            max_wait_frames,
-                            max_action_steps,
-                        )
-                        .is_err()
+                    if !line.is_empty() && handle_line(line, &mut stream, sender, settings).is_err()
                     {
                         return;
                     }
@@ -216,11 +228,9 @@ fn handle_line(
     line: &str,
     stream: &mut TcpStream,
     sender: &SyncSender<AgentRequest>,
-    command_timeout: Duration,
-    max_wait_frames: u16,
-    max_action_steps: u16,
+    settings: &ServerSettings,
 ) -> io::Result<()> {
-    let request = match parse_request(line, max_wait_frames, max_action_steps) {
+    let request = match parse_request(line, settings.max_wait_frames, settings.max_action_steps) {
         Ok(request) => request,
         Err(error) => {
             return write_response(
@@ -239,7 +249,7 @@ fn handle_line(
     };
 
     match sender.try_send(agent_request) {
-        Ok(()) => wait_for_response(stream, response_receiver, id, command_timeout),
+        Ok(()) => wait_for_response(stream, response_receiver, id, settings.command_timeout),
         Err(TrySendError::Full(request)) => write_response(
             stream,
             &AgentResponse::error(request.id, "queue_full", "game command queue is full"),

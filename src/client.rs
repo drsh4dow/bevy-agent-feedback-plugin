@@ -23,7 +23,7 @@ pub struct AgentClientConfig {
     pub protocol_file: PathBuf,
     /// TCP connect/read/write timeout.
     pub timeout: Duration,
-    /// Optional request-only transcript path.
+    /// Optional replayable transcript path.
     pub transcript_file: Option<PathBuf>,
     /// OCR settings used by `ocr_*` and text assertions.
     pub ocr: OcrOptions,
@@ -92,7 +92,9 @@ pub struct AgentClient {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
     next_id: u64,
+    timeout: Duration,
     transcript: Option<File>,
+    last_capture: Option<PathBuf>,
     ocr: OcrOptions,
 }
 
@@ -182,7 +184,9 @@ impl AgentClient {
             stream,
             reader,
             next_id: 1,
+            timeout: config.timeout,
             transcript,
+            last_capture: None,
             ocr: config.ocr,
         })
     }
@@ -200,21 +204,34 @@ impl AgentClient {
         self.next_id = self.next_id.saturating_add(1);
 
         let line = serde_json::to_string(&request)?;
-        if let Some(transcript) = &mut self.transcript {
-            writeln!(transcript, "{line}")?;
-            transcript.flush()?;
-        }
+        let ts_ms = u64::try_from(unix_ms()).unwrap_or(u64::MAX);
+        let start = Instant::now();
         writeln!(self.stream, "{line}")?;
         self.stream.flush()?;
 
         let mut response = String::new();
-        self.reader.read_line(&mut response)?;
+        if let Err(error) = self.reader.read_line(&mut response) {
+            return Err(self.read_error(error));
+        }
         if response.is_empty() {
             return Err(ClientError::Io(
                 "agent socket closed before response".to_string(),
             ));
         }
         let response: Value = serde_json::from_str(&response)?;
+        if let Some(transcript) = &mut self.transcript {
+            serde_json::to_writer(
+                &mut *transcript,
+                &json!({
+                    "ts_ms": ts_ms,
+                    "duration_ms": u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "request": request,
+                    "response": response,
+                }),
+            )?;
+            writeln!(transcript)?;
+            transcript.flush()?;
+        }
         if response["ok"] == Value::Bool(true) {
             return Ok(response);
         }
@@ -222,23 +239,30 @@ impl AgentClient {
             .as_str()
             .unwrap_or("command_failed")
             .to_string();
-        let message = response["error"]["message"]
+        let mut message = response["error"]["message"]
             .as_str()
             .unwrap_or("game returned an error")
             .to_string();
+        if code == "timeout" {
+            message = self.with_last_capture(message);
+        }
         Err(ClientError::Command { code, message })
     }
 
-    /// Replays request-only JSON-lines from disk.
+    /// Replays request-only or transcript-envelope JSON-lines from disk.
     pub fn replay_jsonl(&mut self, path: impl AsRef<Path>) -> Result<Vec<Value>, ClientError> {
         let file = File::open(path)?;
+        let lines = BufReader::new(file)
+            .lines()
+            .collect::<Result<Vec<_>, _>>()?;
         let mut responses = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
+        for line in lines {
             if line.trim().is_empty() {
                 continue;
             }
-            responses.push(self.request(serde_json::from_str(&line)?)?);
+            let value: Value = serde_json::from_str(&line)?;
+            let request = value.get("request").cloned().unwrap_or(value);
+            responses.push(self.request(request)?);
         }
         Ok(responses)
     }
@@ -251,7 +275,9 @@ impl AgentClient {
     /// Captures the primary window as a PNG.
     pub fn capture(&mut self) -> Result<Capture, ClientError> {
         let response = self.request(json!({"command": "capture"}))?;
-        capture_from_response(&response)
+        let capture = capture_from_response(&response)?;
+        self.last_capture = Some(capture.path.clone());
+        Ok(capture)
     }
 
     /// Waits for `frames` Bevy frames.
@@ -333,6 +359,24 @@ impl AgentClient {
         self.request(json!({"command": "shutdown"}))
     }
 
+    fn read_error(&self, error: io::Error) -> ClientError {
+        if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock {
+            ClientError::Io(self.with_last_capture(format!(
+                "agent request timed out after {} ms",
+                self.timeout.as_millis()
+            )))
+        } else {
+            ClientError::Io(error.to_string())
+        }
+    }
+
+    fn with_last_capture(&self, message: String) -> String {
+        match &self.last_capture {
+            Some(path) => format!("{message}; last captured frame: {}", path.display()),
+            None => message,
+        }
+    }
+
     /// Counts differing pixels across two equally-sized images.
     pub fn pixel_diff(a: impl AsRef<Path>, b: impl AsRef<Path>) -> Result<u64, ClientError> {
         let a = image::ImageReader::open(a)?.decode().map_err(image_error)?;
@@ -349,6 +393,61 @@ impl AgentClient {
         let a = image::ImageReader::open(a)?.decode().map_err(image_error)?;
         let b = image::ImageReader::open(b)?.decode().map_err(image_error)?;
         diff_images(&a, &b, Some(region))
+    }
+
+    /// Asserts that two screenshots differ by at least `min_pixels`.
+    pub fn assert_changed(
+        a: impl AsRef<Path>,
+        b: impl AsRef<Path>,
+        min_pixels: u64,
+    ) -> Result<(), ClientError> {
+        let changed = Self::pixel_diff(&a, &b)?;
+        if changed >= min_pixels {
+            return Ok(());
+        }
+        Err(ClientError::Assertion(format!(
+            "screenshots changed {changed} pixels, expected at least {min_pixels}: {} and {}",
+            a.as_ref().display(),
+            b.as_ref().display()
+        )))
+    }
+
+    /// Asserts that two screenshots differ by at least `min_pixels` inside `region`.
+    pub fn assert_region_changed(
+        a: impl AsRef<Path>,
+        b: impl AsRef<Path>,
+        region: Region,
+        min_pixels: u64,
+    ) -> Result<(), ClientError> {
+        let changed = Self::region_diff(&a, &b, region)?;
+        if changed >= min_pixels {
+            return Ok(());
+        }
+        Err(ClientError::Assertion(format!(
+            "region {:?} changed {changed} pixels, expected at least {min_pixels}: {} and {}",
+            region,
+            a.as_ref().display(),
+            b.as_ref().display()
+        )))
+    }
+
+    /// Asserts that a color appears at least `min_pixels` times.
+    pub fn assert_color_present(
+        path: impl AsRef<Path>,
+        color: [u8; 3],
+        region: Option<Region>,
+        tolerance: u8,
+        min_pixels: u64,
+    ) -> Result<(), ClientError> {
+        let found = color_pixel_count(path.as_ref(), color, region, tolerance)?;
+        if found >= min_pixels {
+            return Ok(());
+        }
+        Err(ClientError::Assertion(format!(
+            "color {:?} found {found} pixels, expected at least {min_pixels}: {}",
+            color,
+            path.as_ref().display()
+        )))
     }
 
     /// Captures until the screenshot differs from `before`.
@@ -579,10 +678,26 @@ fn image_has_color(
     region: Region,
     tolerance: u8,
 ) -> Result<bool, ClientError> {
+    Ok(color_pixel_count(path, color, Some(region), tolerance)? > 0)
+}
+
+fn color_pixel_count(
+    path: &Path,
+    color: [u8; 3],
+    region: Option<Region>,
+    tolerance: u8,
+) -> Result<u64, ClientError> {
     let image = image::ImageReader::open(path)?
         .decode()
         .map_err(image_error)?;
+    let region = region.unwrap_or(Region {
+        x: 0,
+        y: 0,
+        width: image.width(),
+        height: image.height(),
+    });
     validate_region(&image, region)?;
+    let mut found = 0;
     for y in region.y..region.y + region.height {
         for x in region.x..region.x + region.width {
             let pixel = image.get_pixel(x, y);
@@ -590,11 +705,11 @@ fn image_has_color(
                 && close(pixel[1], color[1], tolerance)
                 && close(pixel[2], color[2], tolerance)
             {
-                return Ok(true);
+                found += 1;
             }
         }
     }
-    Ok(false)
+    Ok(found)
 }
 
 fn validate_region(image: &image::DynamicImage, region: Region) -> Result<(), ClientError> {
@@ -718,6 +833,25 @@ mod tests {
             .expect("region diff"),
             0
         );
+        AgentClient::assert_changed(&a, &b, 1).expect("changed");
+        let error = AgentClient::assert_changed(&a, &b, 2).expect_err("threshold");
+        assert!(error.to_string().contains("changed 1 pixels"));
+        AgentClient::assert_region_changed(
+            &a,
+            &b,
+            Region {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
+            1,
+        )
+        .expect("region changed");
+        AgentClient::assert_color_present(&b, [255, 0, 0], None, 0, 1).expect("color present");
+        let error = AgentClient::assert_color_present(&b, [255, 0, 0], None, 0, 2)
+            .expect_err("color threshold");
+        assert!(error.to_string().contains("found 1 pixels"));
         let _ = fs::remove_dir_all(root);
     }
 

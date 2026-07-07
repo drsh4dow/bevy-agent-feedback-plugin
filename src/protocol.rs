@@ -60,6 +60,7 @@ pub(crate) enum AgentCommand {
     ListEntities,
     CameraInfo,
     StateInfo,
+    MarkerInfo,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -196,6 +197,7 @@ enum WireCommand {
     ListEntities,
     CameraInfo,
     StateInfo,
+    MarkerInfo,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,6 +372,7 @@ pub(crate) fn parse_request(
         WireCommand::ListEntities => AgentCommand::ListEntities,
         WireCommand::CameraInfo => AgentCommand::CameraInfo,
         WireCommand::StateInfo => AgentCommand::StateInfo,
+        WireCommand::MarkerInfo => AgentCommand::MarkerInfo,
     };
 
     Ok(AgentRequestBody {
@@ -440,6 +443,45 @@ pub(crate) fn write_protocol_file(
     fs::create_dir_all(&config.capture_dir)?;
     session.write_heartbeat()?;
 
+    // Split large JSON blocks to keep serde_json::json! below its recursion limit.
+    let commands = json!({
+        "key_down": { "key": "case-insensitive Bevy KeyCode string, e.g. KeyW" },
+        "key_up": { "key": "case-insensitive Bevy KeyCode string, e.g. KeyW" },
+        "mouse_down": { "button": "case-insensitive MouseButton string, e.g. Left" },
+        "mouse_up": { "button": "case-insensitive MouseButton string, e.g. Left" },
+        "cursor_move": { "x": "logical pixels", "y": "logical pixels" },
+        "mouse_motion": { "dx": "raw motion delta", "dy": "raw motion delta" },
+        "mouse_scroll": { "x": "horizontal scroll", "y": "vertical scroll", "unit": "Line or Pixel; default Line" },
+        "scroll": { "lines": "vertical line delta", "x": "optional horizontal line delta" },
+        "click": { "x": "logical pixels", "y": "logical pixels", "button": "default Left", "frames": "press duration" },
+        "drag": { "from": "[x,y]", "to": "[x,y]", "button": "default Left", "steps": format!("1..={}", config.max_action_steps.max(1)), "frames": format!("steps..={}", config.max_wait_frames) },
+        "key_tap": { "key": "case-insensitive Bevy KeyCode string", "frames": "press duration" },
+        "key_hold": { "key": "case-insensitive Bevy KeyCode string", "frames": "hold duration" },
+        "release_all_inputs": {},
+        "shutdown": {},
+        "text": { "value": "UTF-8 text committed through Bevy Ime" },
+        "file_hover": { "path": "path string" },
+        "file_drop": { "path": "path string" },
+        "file_cancel": {},
+        "window_info": {},
+        "wait": { "frames": format!("1..={}", config.max_wait_frames) },
+        "capture": {},
+        "ecs_summary": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
+        "list_entities": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
+        "camera_info": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
+        "state_info": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
+        "marker_info": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin::with_marker::<T>()" }
+    });
+    let examples = json!([
+        { "id": 1, "command": "window_info" },
+        { "id": 2, "command": "click", "x": 320.0, "y": 240.0, "button": "left" },
+        { "id": 3, "command": "drag", "from": [320.0, 240.0], "to": [420.0, 240.0], "button": "Right", "steps": 5, "frames": 5 },
+        { "id": 4, "command": "key_tap", "key": "keyw" },
+        { "id": 5, "command": "capture" },
+        { "id": 6, "command": "release_all_inputs" },
+        { "id": 7, "command": "marker_info" },
+        { "id": 8, "command": "shutdown" }
+    ]);
     let protocol = json!({
         "protocol": PROTOCOL_VERSION,
         "session_id": session.session_id,
@@ -455,42 +497,8 @@ pub(crate) fn write_protocol_file(
         "capture_dir": config.capture_dir.to_string_lossy(),
         "command_timeout_ms": config.command_timeout.as_millis(),
         "max_action_steps": config.max_action_steps,
-        "commands": {
-            "key_down": { "key": "case-insensitive Bevy KeyCode string, e.g. KeyW" },
-            "key_up": { "key": "case-insensitive Bevy KeyCode string, e.g. KeyW" },
-            "mouse_down": { "button": "case-insensitive MouseButton string, e.g. Left" },
-            "mouse_up": { "button": "case-insensitive MouseButton string, e.g. Left" },
-            "cursor_move": { "x": "logical pixels", "y": "logical pixels" },
-            "mouse_motion": { "dx": "raw motion delta", "dy": "raw motion delta" },
-            "mouse_scroll": { "x": "horizontal scroll", "y": "vertical scroll", "unit": "Line or Pixel; default Line" },
-            "scroll": { "lines": "vertical line delta", "x": "optional horizontal line delta" },
-            "click": { "x": "logical pixels", "y": "logical pixels", "button": "default Left", "frames": "press duration" },
-            "drag": { "from": "[x,y]", "to": "[x,y]", "button": "default Left", "steps": format!("1..={}", config.max_action_steps.max(1)), "frames": format!("steps..={}", config.max_wait_frames) },
-            "key_tap": { "key": "case-insensitive Bevy KeyCode string", "frames": "press duration" },
-            "key_hold": { "key": "case-insensitive Bevy KeyCode string", "frames": "hold duration" },
-            "release_all_inputs": {},
-            "shutdown": {},
-            "text": { "value": "UTF-8 text committed through Bevy Ime" },
-            "file_hover": { "path": "path string" },
-            "file_drop": { "path": "path string" },
-            "file_cancel": {},
-            "window_info": {},
-            "wait": { "frames": format!("1..={}", config.max_wait_frames) },
-            "capture": {},
-            "ecs_summary": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
-            "list_entities": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
-            "camera_info": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
-            "state_info": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" }
-        },
-        "examples": [
-            { "id": 1, "command": "window_info" },
-            { "id": 2, "command": "click", "x": 320.0, "y": 240.0, "button": "left" },
-            { "id": 3, "command": "drag", "from": [320.0, 240.0], "to": [420.0, 240.0], "button": "Right", "steps": 5, "frames": 5 },
-            { "id": 4, "command": "key_tap", "key": "keyw" },
-            { "id": 5, "command": "capture" },
-            { "id": 6, "command": "release_all_inputs" },
-            { "id": 7, "command": "shutdown" }
-        ]
+        "commands": commands,
+        "examples": examples,
     });
     let bytes = serde_json::to_vec_pretty(&protocol).map_err(io::Error::other)?;
     fs::write(&config.protocol_file, bytes)

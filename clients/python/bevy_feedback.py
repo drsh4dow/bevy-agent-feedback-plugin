@@ -39,6 +39,7 @@ class BevyFeedbackClient:
         self.tesseract = str(tesseract or os.environ.get("BEVY_FEEDBACK_TESSERACT") or "tesseract")
         self.ocr_language = ocr_language
         self.ocr_timeout = ocr_timeout
+        self._last_capture: Path | None = None
         transcript = transcript_file or os.environ.get("BEVY_FEEDBACK_TRANSCRIPT")
         self._transcript = open(transcript, "a", encoding="utf-8") if transcript else None
         protocol = self._read_protocol()
@@ -81,28 +82,38 @@ class BevyFeedbackClient:
         request.setdefault("id", self._next_id)
         self._next_id += 1
         line = json.dumps(request, separators=(",", ":"))
-        if self._transcript:
-            self._transcript.write(line + "\n")
-            self._transcript.flush()
+        ts_ms = int(time.time() * 1000)
+        started = time.monotonic()
         self._stream.write(line + "\n")
         self._stream.flush()
-        response_line = self._stream.readline()
+        try:
+            response_line = self._stream.readline()
+        except socket.timeout as error:
+            message = self._with_last_capture(f"agent request timed out after {self.timeout}s")
+            raise BevyFeedbackError(message) from error
         if not response_line:
             raise BevyFeedbackError("agent socket closed before response")
         response = json.loads(response_line)
+        self._write_transcript(ts_ms, int((time.monotonic() - started) * 1000), request, response)
         if response.get("ok") is True:
             return response
         error = response.get("error") or {}
-        raise BevyFeedbackError(f"command failed [{error.get('code', 'error')}]: {error.get('message', response)}")
+        message = error.get("message", response)
+        if error.get("code") == "timeout":
+            message = self._with_last_capture(str(message))
+        raise BevyFeedbackError(f"command failed [{error.get('code', 'error')}]: {message}")
 
     def replay_jsonl(self, path: str | os.PathLike[str]) -> list[dict[str, Any]]:
-        """Replay request-only JSON-lines from disk."""
+        """Replay request-only or transcript-envelope JSON-lines from disk."""
         responses = []
         with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    responses.append(self.request(json.loads(line)))
+            lines = list(handle)
+        for line in lines:
+            line = line.strip()
+            if line:
+                value = json.loads(line)
+                request = value.get("request", value) if isinstance(value, dict) else value
+                responses.append(self.request(request))
         return responses
 
     def wait(self, frames: int = 1) -> dict[str, Any]:
@@ -110,7 +121,8 @@ class BevyFeedbackClient:
 
     def capture(self) -> Path:
         response = self.request({"command": "capture"})
-        return Path(response["result"]["capture"]["path"])
+        self._last_capture = Path(response["result"]["capture"]["path"])
+        return self._last_capture
 
     def window_info(self) -> dict[str, Any]:
         return self.request({"command": "window_info"})
@@ -168,9 +180,47 @@ class BevyFeedbackClient:
     def shutdown(self) -> dict[str, Any]:
         return self.request({"command": "shutdown"})
 
-    def assert_changed(self, before: str | os.PathLike[str], after: str | os.PathLike[str]) -> None:
-        if pixel_diff(before, after) == 0:
-            raise BevyFeedbackError(f"screenshots did not change: {before} and {after}")
+    def assert_changed(
+        self,
+        before: str | os.PathLike[str],
+        after: str | os.PathLike[str],
+        *,
+        min_pixels: int = 1,
+    ) -> None:
+        changed = pixel_diff(before, after)
+        if changed < min_pixels:
+            raise BevyFeedbackError(
+                f"screenshots changed {changed} pixels, expected at least {min_pixels}: {before} and {after}"
+            )
+
+    def assert_region_changed(
+        self,
+        before: str | os.PathLike[str],
+        after: str | os.PathLike[str],
+        region: tuple[int, int, int, int],
+        *,
+        min_pixels: int = 1,
+    ) -> None:
+        changed = region_diff(before, after, region)
+        if changed < min_pixels:
+            raise BevyFeedbackError(
+                f"region {region} changed {changed} pixels, expected at least {min_pixels}: {before} and {after}"
+            )
+
+    def assert_color_present(
+        self,
+        path: str | os.PathLike[str],
+        rgb: tuple[int, int, int],
+        region: tuple[int, int, int, int] | None = None,
+        *,
+        tolerance: int = 0,
+        min_pixels: int = 1,
+    ) -> None:
+        found = color_pixel_count(path, rgb, region, tolerance)
+        if found < min_pixels:
+            raise BevyFeedbackError(
+                f"color {rgb} found {found} pixels, expected at least {min_pixels}: {path}"
+            )
 
     def wait_until_changed(self, before: str | os.PathLike[str], *, frames: int = 1, attempts: int = 30) -> Path:
         for _ in range(attempts):
@@ -232,6 +282,33 @@ class BevyFeedbackClient:
                     raise
         raise BevyFeedbackError(f"text did not appear: {expected}")
 
+    def _write_transcript(
+        self,
+        ts_ms: int,
+        duration_ms: int,
+        request: dict[str, Any],
+        response: dict[str, Any],
+    ) -> None:
+        if self._transcript:
+            self._transcript.write(
+                json.dumps(
+                    {
+                        "ts_ms": ts_ms,
+                        "duration_ms": duration_ms,
+                        "request": request,
+                        "response": response,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            self._transcript.flush()
+
+    def _with_last_capture(self, message: str) -> str:
+        if self._last_capture:
+            return f"{message}; last captured frame: {self._last_capture}"
+        return message
+
     def _read_protocol(self) -> dict[str, Any]:
         with open(self.protocol_file, encoding="utf-8") as handle:
             protocol = json.load(handle)
@@ -278,21 +355,31 @@ def region_diff(a: str | os.PathLike[str], b: str | os.PathLike[str], region: tu
 def image_has_color(
     path: str | os.PathLike[str],
     color: tuple[int, int, int],
-    region: tuple[int, int, int, int],
+    region: tuple[int, int, int, int] | None = None,
     tolerance: int = 0,
 ) -> bool:
+    return color_pixel_count(path, color, region, tolerance) > 0
+
+
+def color_pixel_count(
+    path: str | os.PathLike[str],
+    color: tuple[int, int, int],
+    region: tuple[int, int, int, int] | None = None,
+    tolerance: int = 0,
+) -> int:
     try:
         from PIL import Image
     except ImportError as error:
         raise BevyFeedbackError("Pillow is required for image assertions") from error
     image = Image.open(path).convert("RGB")
-    x, y, width, height = region
+    x, y, width, height = region or (0, 0, image.width, image.height)
+    found = 0
     for py in range(y, y + height):
         for px in range(x, x + width):
             pixel = image.getpixel((px, py))
             if all(abs(pixel[index] - color[index]) <= tolerance for index in range(3)):
-                return True
-    return False
+                found += 1
+    return found
 
 
 def _run_tesseract(tesseract: str, language: str, timeout: float, path: Path) -> str:

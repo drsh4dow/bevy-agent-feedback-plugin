@@ -2,7 +2,7 @@ use bevy_agent_feedback_plugin::client::{AgentClient, AgentClientConfig};
 use serde_json::Value;
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, ExitStatus, Stdio},
     sync::{
@@ -34,8 +34,9 @@ fn real_main() -> Result<(), String> {
     }
     let _ = fs::remove_file(&args.protocol_file);
 
+    let game_log = args.artifacts.join("game.log");
     let log_file = Arc::new(Mutex::new(
-        File::create(args.artifacts.join("game.log")).map_err(|error| error.to_string())?,
+        File::create(&game_log).map_err(|error| error.to_string())?,
     ));
     let capture_dir = args.artifacts.join("captures");
     let transcript_file = args.artifacts.join("transcript.jsonl");
@@ -47,7 +48,21 @@ fn real_main() -> Result<(), String> {
     ctrlc::set_handler(move || stop_for_signal.store(true, Ordering::Relaxed))
         .map_err(|error| error.to_string())?;
 
-    let ready = wait_ready(&args.protocol_file, args.ready_timeout, &mut game, &stop)?;
+    let ready = match wait_ready(&args.protocol_file, args.ready_timeout, &mut game, &stop) {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = game.kill();
+            let _ = game.wait();
+            copy_if_exists(&args.protocol_file, &args.artifacts.join("protocol.json"));
+            copy_captures(&capture_dir, &args.artifacts.join("screenshots"));
+            return fail_run(
+                &args.artifacts,
+                &game_log,
+                &capture_dir,
+                format!("{error}\n"),
+            );
+        }
+    };
     println!(
         "bevy-feedback ready: session={} socket={} protocol={}",
         ready.session_id,
@@ -98,12 +113,7 @@ fn real_main() -> Result<(), String> {
         failure_summary.push_str(&format!("game exited with status {status}\n"));
     }
     if driver_failed || game_failed {
-        fs::write(args.artifacts.join("failure-summary.txt"), failure_summary)
-            .map_err(|error| error.to_string())?;
-        return Err(format!(
-            "run failed; artifacts: {}",
-            args.artifacts.display()
-        ));
+        return fail_run(&args.artifacts, &game_log, &capture_dir, failure_summary);
     }
     println!("bevy-feedback artifacts: {}", args.artifacts.display());
     Ok(())
@@ -192,7 +202,19 @@ fn parse_game_driver(
 }
 
 fn usage() -> String {
-    "usage: bevy-feedback run [--protocol FILE] [--artifacts DIR] -- <game command...>\n       bevy-feedback run [--protocol FILE] [--artifacts DIR] --game <game...> --driver <driver...>".to_string()
+    "usage:
+  bevy-feedback run [--protocol FILE] [--artifacts DIR] -- <game command...>
+  bevy-feedback run [--protocol FILE] [--artifacts DIR] --game <game...> --driver <driver...>
+
+env:
+  BEVY_FEEDBACK_PROTOCOL    protocol file (default target/agent-feedback/agent-feedback.json)
+  BEVY_FEEDBACK_ARTIFACTS   artifact dir (default target/agent-feedback/artifacts/run-<unix-ms>)
+  BEVY_FEEDBACK_CAPTURE_DIR exported to game/driver as the capture dir
+  BEVY_FEEDBACK_TRANSCRIPT  exported to game/driver as transcript.jsonl
+
+timeouts:
+  readiness 60s, driver 300s, shutdown 5s"
+        .to_string()
 }
 
 fn spawn_command(
@@ -238,6 +260,7 @@ fn stream_log(pipe: impl Read + Send + 'static, stderr: bool, log_file: Arc<Mute
             }
             if let Ok(mut file) = log_file.lock() {
                 let _ = file.write_all(line.as_bytes());
+                let _ = file.flush();
             }
             line.clear();
         }
@@ -318,6 +341,67 @@ fn wait_child(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitSta
         thread::sleep(Duration::from_millis(100));
     }
     Ok(None)
+}
+
+fn fail_run(
+    artifacts: &Path,
+    game_log: &Path,
+    capture_dir: &Path,
+    mut failure_summary: String,
+) -> Result<(), String> {
+    append_failure_context(&mut failure_summary, game_log, capture_dir);
+    fs::write(artifacts.join("failure-summary.txt"), &failure_summary)
+        .map_err(|error| error.to_string())?;
+    Err(format!(
+        "run failed; artifacts: {}\n{}",
+        artifacts.display(),
+        failure_summary.trim_end()
+    ))
+}
+
+fn append_failure_context(failure_summary: &mut String, game_log: &Path, capture_dir: &Path) {
+    failure_summary.push_str(&format!("game log: {}\n", game_log.display()));
+    if let Some(capture) = newest_png(capture_dir) {
+        failure_summary.push_str(&format!("newest capture: {}\n", capture.display()));
+    }
+    if let Ok(lines) = tail_lines(game_log, 20)
+        && !lines.is_empty()
+    {
+        failure_summary.push_str("last 20 game.log lines:\n");
+        failure_summary.push_str(&lines);
+        failure_summary.push('\n');
+    }
+}
+
+fn tail_lines(path: &Path, max_lines: usize) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(64 * 1024)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
+}
+
+fn newest_png(dir: &Path) -> Option<PathBuf> {
+    let mut newest = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("png") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        match &newest {
+            Some((newest_modified, _)) if modified <= *newest_modified => {}
+            _ => newest = Some((modified, path)),
+        }
+    }
+    newest.map(|(_, path)| path)
 }
 
 fn copy_if_exists(from: &Path, to: &Path) {

@@ -42,6 +42,10 @@ pub struct AgentFeedbackConfig {
 
     /// Maximum time a socket client waits for the game to answer a command.
     pub command_timeout: Duration,
+
+    /// Optional app exit after no accepted agent commands for this duration.
+    /// Values below 5 seconds are clamped up; `None` disables idle shutdown.
+    pub idle_shutdown_after: Option<Duration>,
 }
 
 impl Default for AgentFeedbackConfig {
@@ -57,6 +61,7 @@ impl Default for AgentFeedbackConfig {
             session_stale_after: Duration::from_secs(3),
             max_captures: 32,
             command_timeout: Duration::from_secs(10),
+            idle_shutdown_after: None,
         }
     }
 }

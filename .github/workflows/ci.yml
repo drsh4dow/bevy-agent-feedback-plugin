@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test
+      - run: cargo check --examples
+
+  rendered:
+    name: rendered
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # Keep package details in docs/ci-linux.md.
+      - name: Install Linux display dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libx11-dev libasound2-dev libudev-dev pkg-config
+      - name: Verify rendered agent feedback
+        run: xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
+      - name: Upload agent feedback artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-feedback-artifacts
+          path: target/agent-feedback
+          if-no-files-found: ignore

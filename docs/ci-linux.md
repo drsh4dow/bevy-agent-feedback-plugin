@@ -30,6 +30,16 @@ Rendered smoke:
 xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
 ```
 
+Pin capture dimensions in examples/tests:
+
+```rust
+Window {
+    resolution: bevy::window::WindowResolution::new(1280, 720)
+        .with_scale_factor_override(1.0),
+    ..default()
+}
+```
+
 If WGPU backend selection is flaky in the runner, set one explicitly before running tests:
 
 ```sh
@@ -43,7 +53,7 @@ Upload `target/agent-feedback` (or `$AGENT_FEEDBACK_ARTIFACT_ROOT`) on failure a
 - protocol/session copy
 - heartbeat metadata
 - game logs
-- request transcript
+- replayable transcript with responses/timing
 - captures/screenshots
 - failure summary from `bevy-feedback run`
 
