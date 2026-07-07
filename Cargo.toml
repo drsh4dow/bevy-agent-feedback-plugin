@@ -1,6 +1,6 @@
 [package]
 name = "bevy-agent-feedback-plugin"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Bevy plugin for Pi/Codex-driven input and screenshot feedback."
 readme = "README.md"
