@@ -2,7 +2,7 @@
 
 Local agent feedback for Bevy apps.
 
-This crate lets Pi/Codex drive a running Bevy app through a small JSON-lines TCP protocol. An agent can press keys, move/click/drag/scroll the mouse, submit text and file-drop events, query primary-window coordinates, wait for frames, and capture the primary window as PNGs.
+This crate lets Pi/Codex drive a running Bevy app through a v2 JSON-lines TCP protocol. Agents can press keys, move/click/drag/scroll the mouse, submit text/file-drop events, query window metadata, wait for frames, capture PNG screenshots, replay transcripts, and shut the app down cleanly.
 
 ## Quick Start
 
@@ -24,58 +24,44 @@ fn main() {
 }
 ```
 
-Use port `0` for examples and tests. The plugin writes the chosen socket address to the protocol file.
+Use port `0` for examples and tests. The plugin writes a self-describing protocol file with the chosen socket, session heartbeat, capture directory, commands, and examples.
 
-## Pi/Codex Workflow
+## Drive it
 
-1. Run the Bevy app.
-2. Read the configured protocol file.
-3. Connect to `socket_addr`.
-4. Send one newline-terminated JSON request per command.
-5. Read one newline-terminated JSON response per request.
-6. Inspect `result.capture.path` after `capture`.
+```sh
+cargo run --bin bevy-feedback -- run -- cargo run --example minimal
+```
 
-Example request sequence:
+With a separate driver:
+
+```sh
+cargo run --bin bevy-feedback -- run \
+  --game cargo run --example minimal \
+  --driver python3 my_driver.py
+```
+
+The wrapper exports the protocol/capture/artifact paths, waits for readiness, streams logs, releases inputs, sends `shutdown`, and writes artifacts.
+
+Raw JSON-lines also works:
 
 ```jsonl
 {"id":1,"command":"window_info"}
-{"id":2,"command":"cursor_move","x":320,"y":240}
-{"id":3,"command":"mouse_down","button":"Left"}
-{"id":4,"command":"wait","frames":3}
-{"id":5,"command":"mouse_up","button":"Left"}
-{"id":6,"command":"capture"}
+{"id":2,"command":"click","x":320,"y":240,"button":"left"}
+{"id":3,"command":"key_hold","key":"KeyW","frames":30}
+{"id":4,"command":"capture"}
 ```
 
-Supported commands:
+## Clients
 
-| Command | Fields |
-| --- | --- |
-| `key_down` | `key`, for example `"KeyW"` |
-| `key_up` | `key`, for example `"KeyW"` |
-| `mouse_down` | `button`, for example `"Left"` |
-| `mouse_up` | `button`, for example `"Left"` |
-| `cursor_move` | `x`, `y` in logical primary-window pixels |
-| `mouse_motion` | `dx`, `dy` raw motion delta |
-| `mouse_scroll` | `y`, optional `x`, optional `unit` (`"Line"` or `"Pixel"`) |
-| `text` | `value`, committed through Bevy `Ime` |
-| `file_hover` | `path` |
-| `file_drop` | `path` |
-| `file_cancel` | none |
-| `window_info` | none |
-| `wait` | optional `frames`; defaults to `1` |
-| `capture` | none |
+Rust: `bevy_agent_feedback_plugin::client::AgentClient`.
+Python: `clients/python/bevy_feedback.py`; `skills/driving-bevy-games/drive.py` remains a compatibility wrapper.
 
-Valid responses echo `id`, set `ok`, and include either `result` or `error`; malformed requests may return `id: null`. Window-aware responses include logical size, physical size, scale factor, and cursor position so agents can convert between screenshots and Bevy logical coordinates. Keyboard commands target physical `KeyCode` input; apps should read `ButtonInput<KeyCode>` or `KeyboardInput.key_code`. Compose click as `cursor_move`, `mouse_down`, `wait` 1 frame, `mouse_up`; compose drag by inserting more `cursor_move` steps before `mouse_up`.
+Both clients can replay transcripts, release held inputs on close, and run optional OCR assertions through the system `tesseract` CLI.
 
-## Examples
+## Optional diagnostics
 
-See [`examples/README.md`](examples/README.md).
+Enable the `diagnostics` feature and add `AgentFeedbackDiagnosticsPlugin` for `ecs_summary`, `list_entities`, `camera_info`, and registered `state_info` commands.
 
-- `minimal`: instrumented Bevy app for an external Pi/Codex driver.
-- `agent_driven`: self-driving demo using the same TCP protocol.
+## CI
 
-## Notes
-
-- Keep the socket bound to localhost unless you add your own access control.
-- Captures require a graphics-capable environment.
-- Agent input is injected before normal `Update` systems read `ButtonInput`.
+See [`docs/ci-linux.md`](docs/ci-linux.md). Windowed captures need a display (`DISPLAY`, `WAYLAND_DISPLAY`, or `xvfb-run`).

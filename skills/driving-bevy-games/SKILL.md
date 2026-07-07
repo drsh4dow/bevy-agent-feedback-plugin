@@ -7,11 +7,11 @@ You control the game through a look → act → look loop: capture a screenshot,
 
 ## Wire the plugin (once per game)
 
-Dev-only: an optional dependency behind a cargo feature. Release builds never compile it.
+Dev-only: optional dependency behind a cargo feature.
 
 ```toml
 [dependencies]
-bevy-agent-feedback-plugin = { version = "*", optional = true }
+bevy-agent-feedback-plugin = { version = "0.2", optional = true }
 
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
@@ -22,8 +22,12 @@ agent = ["dep:bevy-agent-feedback-plugin"]
 app.add_plugins(bevy_agent_feedback_plugin::AgentFeedbackPlugin::new(
     bevy_agent_feedback_plugin::AgentFeedbackConfig {
         bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        protocol_file: "target/agent-feedback/agent-feedback.json".into(),
-        capture_dir: "target/agent-feedback/captures".into(),
+        protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
+            .map(Into::into)
+            .unwrap_or_else(|| "target/agent-feedback/agent-feedback.json".into()),
+        capture_dir: std::env::var_os("BEVY_FEEDBACK_CAPTURE_DIR")
+            .map(Into::into)
+            .unwrap_or_else(|| "target/agent-feedback/captures".into()),
         ..Default::default()
     },
 ));
@@ -33,18 +37,28 @@ Done when `cargo check --features agent` passes.
 
 ## Launch
 
+Preferred:
+
+```sh
+bevy-feedback run -- cargo run --features agent
+```
+
+The wrapper waits for protocol v2 readiness, streams logs, exports `BEVY_FEEDBACK_*`, writes artifacts, releases inputs, and sends `shutdown` on exit.
+
+Manual fallback:
+
 ```sh
 cargo run --features agent > /tmp/game.log 2>&1 &
 ```
 
-Needs a display (`DISPLAY`/`WAYLAND_DISPLAY`). First build is slow — poll patiently. Done when the protocol file exists and contains `socket_addr`.
+Done when the protocol file exists and has `protocol: "bevy-agent-feedback/2"`, `socket_addr`, `session_id`, `pid`, and fresh heartbeat.
 
 ## Look → act → look
 
-Send commands with the co-located helper (one JSON command per line, one response per line):
+Use the Python client/wrapper:
 
 ```sh
-python3 drive.py target/agent-feedback/agent-feedback.json <<'EOF'
+python3 skills/driving-bevy-games/drive.py target/agent-feedback/agent-feedback.json <<'EOF'
 {"command":"window_info"}
 {"command":"capture"}
 EOF
@@ -52,15 +66,13 @@ EOF
 
 Each iteration:
 
-1. **Look**: `capture`, then view the PNG at `result.capture.path` with the read tool.
-2. **Act** in logical coordinates. Captures are physical pixels; commands take logical pixels: `logical = physical / scale_factor` (from `window_info`). Click = `cursor_move`, `mouse_down`, `wait` 1, `mouse_up`. Drag = extra `cursor_move` steps before `mouse_up`. Held key = `key_down`, `wait` N, `key_up`.
-3. **Wait**: `wait` enough frames for the game to react before looking again.
-4. **Look**: `capture` and confirm the expected change is visible. If it is not, diagnose (check `/tmp/game.log`, re-read `window_info`) before the next action.
+1. **Look**: `capture`, then inspect `result.capture.path`.
+2. **Act** in logical coordinates. Prefer high-level commands: `click`, `drag`, `scroll`, `key_tap`, `key_hold`.
+3. **Wait**: `wait` enough frames for reaction.
+4. **Look**: capture again and verify pixels changed.
 
-An action is done when a capture shows its effect; the session is done when every behavior you report is backed by a capture you viewed.
-
-The protocol file is self-describing — it lists every command with field docs. Read it instead of guessing.
+Capture/window responses include frame, game time, window size/scale, mouse position, and agent-held inputs. If behavior fails, inspect artifacts/logs before more input.
 
 ## Cleanup
 
-Kill the game process and release any held keys/buttons first (`key_up`/`mouse_up`) if the game keeps running.
+Use `release_all_inputs` then `shutdown`. Clients also release on close/disconnect; stale protocol files are rejected by pid/heartbeat checks.

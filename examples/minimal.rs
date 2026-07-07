@@ -8,8 +8,14 @@ struct AgentDriven;
 fn main() {
     let config = AgentFeedbackConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        protocol_file: PathBuf::from("target/agent-feedback/examples/minimal/agent-feedback.json"),
-        capture_dir: PathBuf::from("target/agent-feedback/examples/minimal/captures"),
+        protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from("target/agent-feedback/examples/minimal/agent-feedback.json")
+            }),
+        capture_dir: std::env::var_os("BEVY_FEEDBACK_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/agent-feedback/examples/minimal/captures")),
         ..Default::default()
     };
 

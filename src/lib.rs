@@ -25,9 +25,10 @@
 //!     .run();
 //! ```
 //!
-//! After startup, read the configured protocol file. It contains `socket_addr`,
-//! the capture directory, supported commands, and example JSON requests. Send one
-//! newline-terminated JSON object per request.
+//! After startup, read the configured protocol file. It contains protocol v2
+//! session metadata, `socket_addr`, heartbeat path, capture directory, supported
+//! commands, and example JSON requests. Send one newline-terminated JSON object
+//! per request.
 //!
 //! # Protocol
 //!
@@ -35,16 +36,14 @@
 //! `id`, set `ok`, and include either `result` or `error`; malformed requests
 //! may return `id: null`.
 //!
-//! Supported commands are `key_down`, `key_up`, `mouse_down`, `mouse_up`,
-//! `cursor_move`, `mouse_motion`, `mouse_scroll`, `text`, `file_hover`,
-//! `file_drop`, `file_cancel`, `window_info`, `wait`, and
-//! `capture`. Key commands target physical `KeyCode` input; apps should read
+//! Supported commands include primitives (`key_down`, `mouse_down`,
+//! `cursor_move`, `mouse_scroll`, `wait`, `capture`) and safe compound actions
+//! (`click`, `drag`, `scroll`, `key_tap`, `key_hold`, `release_all_inputs`,
+//! `shutdown`). Key commands target physical `KeyCode` input; apps should read
 //! `ButtonInput<KeyCode>` or `KeyboardInput.key_code`. Cursor coordinates are
-//! logical pixels in the primary window, with origin at the top-left. Responses
-//! from `window_info`, cursor, scroll, text,
-//! file, and capture commands include primary-window size metadata when a
-//! primary window exists. Compose clicks and drags from cursor, button, and
-//! `wait` primitives so press/release can land on separate frames.
+//! logical pixels in the primary window, with origin at the top-left.
+//! Window/capture responses include frame, game time, window metadata, mouse
+//! position, and currently agent-held inputs.
 //!
 //! # Scheduling
 //!
@@ -66,14 +65,20 @@
 
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
+pub mod client;
 mod config;
 mod control;
+#[cfg(feature = "diagnostics")]
+mod diagnostics;
 mod protocol;
 mod runtime;
+mod session;
 
 use bevy::prelude::*;
 pub use config::AgentFeedbackConfig;
 use control::AgentFeedbackControlPlugin;
+#[cfg(feature = "diagnostics")]
+pub use diagnostics::AgentFeedbackDiagnosticsPlugin;
 use runtime::AgentFeedbackRuntimePlugin;
 
 /// Bevy plugin that exposes local agent input and screenshot control.

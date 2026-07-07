@@ -3,7 +3,10 @@ use bevy::{
     prelude::*,
     window::{FileDragAndDrop, Ime, PrimaryWindow},
 };
-use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin};
+use bevy_agent_feedback_plugin::{
+    AgentFeedbackConfig, AgentFeedbackPlugin,
+    client::{AgentClient, AgentClientConfig},
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -18,58 +21,45 @@ use std::{
 fn socket_key_and_mouse_buttons_update_bevy_input() {
     let (mut app, config) = agent_app("key-mouse-buttons");
     let mut stream = connect(&config);
-    stream
-        .write_all(
-            br#"{"id":1,"command":"key_down","key":"KeyW"}
-"#,
-        )
-        .expect("send key command");
 
-    let response = read_response_while_updating(&mut app, &mut stream);
-    assert_eq!(response["ok"], Value::Bool(true));
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"key_down","key":"KeyW"}"#,
+    );
     assert!(
         app.world()
             .resource::<ButtonInput<KeyCode>>()
             .pressed(KeyCode::KeyW)
     );
 
-    stream
-        .write_all(
-            br#"{"id":2,"command":"mouse_down","button":"Left"}
-"#,
-        )
-        .expect("send mouse command");
-
-    let response = read_response_while_updating(&mut app, &mut stream);
-    assert_eq!(response["ok"], Value::Bool(true));
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":2,"command":"mouse_down","button":"Left"}"#,
+    );
     assert!(
         app.world()
             .resource::<ButtonInput<MouseButton>>()
             .pressed(MouseButton::Left)
     );
 
-    stream
-        .write_all(
-            br#"{"id":3,"command":"mouse_up","button":"Left"}
-"#,
-        )
-        .expect("send mouse command");
-    let response = read_response_while_updating(&mut app, &mut stream);
-    assert_eq!(response["ok"], Value::Bool(true));
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":3,"command":"mouse_up","button":"Left"}"#,
+    );
     assert!(
         !app.world()
             .resource::<ButtonInput<MouseButton>>()
             .pressed(MouseButton::Left)
     );
 
-    stream
-        .write_all(
-            br#"{"id":4,"command":"key_up","key":"KeyW"}
-"#,
-        )
-        .expect("send key command");
-    let response = read_response_while_updating(&mut app, &mut stream);
-    assert_eq!(response["ok"], Value::Bool(true));
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":4,"command":"key_up","key":"KeyW"}"#,
+    );
     assert!(
         !app.world()
             .resource::<ButtonInput<KeyCode>>()
@@ -83,15 +73,12 @@ fn socket_key_and_mouse_buttons_update_bevy_input() {
 fn socket_cursor_move_updates_window_and_returns_metadata() {
     let (mut app, config) = agent_app("cursor-move");
     let mut stream = connect(&config);
-    stream
-        .write_all(
-            br#"{"id":1,"command":"cursor_move","x":320,"y":240}
-"#,
-        )
-        .expect("send cursor command");
 
-    let response = read_response_while_updating(&mut app, &mut stream);
-    assert_eq!(response["ok"], Value::Bool(true));
+    let response = send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"cursor_move","x":320,"y":240}"#,
+    );
     assert_eq!(
         response["result"]["window"]["logical_width"],
         Value::from(640.0)
@@ -113,48 +100,25 @@ fn socket_text_scroll_and_file_drop_emit_bevy_messages() {
         .add_systems(Update, observe_controls);
     let mut stream = connect(&config);
 
-    stream
-        .write_all(
-            br#"{"id":1,"command":"text","value":"hello"}
-"#,
-        )
-        .expect("send text command");
-    assert_eq!(
-        read_response_while_updating(&mut app, &mut stream)["ok"],
-        Value::Bool(true)
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"text","value":"hello"}"#,
     );
-
-    stream
-        .write_all(
-            br#"{"id":2,"command":"mouse_motion","dx":5,"dy":-2}
-"#,
-        )
-        .expect("send motion command");
-    assert_eq!(
-        read_response_while_updating(&mut app, &mut stream)["ok"],
-        Value::Bool(true)
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":2,"command":"mouse_motion","dx":5,"dy":-2}"#,
     );
-
-    stream
-        .write_all(
-            br#"{"id":3,"command":"mouse_scroll","y":-1}
-"#,
-        )
-        .expect("send scroll command");
-    assert_eq!(
-        read_response_while_updating(&mut app, &mut stream)["ok"],
-        Value::Bool(true)
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":3,"command":"mouse_scroll","y":-1}"#,
     );
-
-    stream
-        .write_all(
-            br#"{"id":4,"command":"file_drop","path":"/tmp/agent-file.txt"}
-"#,
-        )
-        .expect("send file drop command");
-    assert_eq!(
-        read_response_while_updating(&mut app, &mut stream)["ok"],
-        Value::Bool(true)
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":4,"command":"file_drop","path":"/tmp/agent-file.txt"}"#,
     );
 
     let observed = app.world().resource::<ObservedControls>();
@@ -166,6 +130,235 @@ fn socket_text_scroll_and_file_drop_emit_bevy_messages() {
         observed.dropped_file,
         Some(PathBuf::from("/tmp/agent-file.txt"))
     );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn high_level_actions_release_after_requested_frames() {
+    let (mut app, config) = agent_app("high-level-actions");
+    let mut stream = connect(&config);
+
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"key_hold","key":"keyw","frames":2}"#,
+    );
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":2,"command":"click","x":320,"y":240,"button":"left","frames":1}"#,
+    );
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn release_all_inputs_releases_tracked_inputs() {
+    let (mut app, config) = agent_app("release-all");
+    let mut stream = connect(&config);
+
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"key_down","key":"KeyW"}"#,
+    );
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":2,"command":"mouse_down","button":"Left"}"#,
+    );
+    assert!(
+        app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+    assert!(
+        app.world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+    );
+
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":3,"command":"release_all_inputs"}"#,
+    );
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<MouseButton>>()
+            .pressed(MouseButton::Left)
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn diagnostics_without_plugin_returns_clear_error() {
+    let (mut app, config) = agent_app("diagnostics-unavailable");
+    let mut stream = connect(&config);
+    let response = send(&mut app, &mut stream, r#"{"id":1,"command":"ecs_summary"}"#);
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert_eq!(response["error"]["code"], "diagnostics_unavailable");
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn shutdown_command_returns_ok() {
+    let (mut app, config) = agent_app("shutdown");
+    let mut stream = connect(&config);
+    send_ok(&mut app, &mut stream, r#"{"id":1,"command":"shutdown"}"#);
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn disconnect_during_pending_action_releases_inputs() {
+    let (mut app, config) = agent_app("disconnect-pending-action");
+    let mut stream = connect(&config);
+    send_raw(
+        &mut stream,
+        r#"{"id":1,"command":"key_hold","key":"KeyW","frames":60}"#,
+    );
+
+    for _ in 0..20 {
+        app.update();
+        if app
+            .world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+
+    drop(stream);
+    for _ in 0..30 {
+        app.update();
+        if !app
+            .world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn disconnect_releases_tracked_inputs() {
+    let (mut app, config) = agent_app("disconnect-release");
+    let mut stream = connect(&config);
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"key_down","key":"KeyW"}"#,
+    );
+    assert!(
+        app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+
+    drop(stream);
+    for _ in 0..20 {
+        app.update();
+        if !app
+            .world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !app.world()
+            .resource::<ButtonInput<KeyCode>>()
+            .pressed(KeyCode::KeyW)
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn runtime_drop_removes_live_protocol_files() {
+    let config;
+    let heartbeat_file;
+    {
+        let (app, app_config) = agent_app("cleanup");
+        config = app_config;
+        heartbeat_file = heartbeat_path(&config);
+        assert!(config.protocol_file.exists());
+        assert!(heartbeat_file.exists());
+        drop(app);
+    }
+
+    assert!(!config.protocol_file.exists());
+    assert!(!heartbeat_file.exists());
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn rust_client_writes_request_transcript() {
+    let (mut app, config) = agent_app("rust-client-transcript");
+    let transcript_file = config
+        .protocol_file
+        .parent()
+        .expect("protocol parent")
+        .join("transcript.jsonl");
+    let protocol_file = config.protocol_file.clone();
+    let client = thread::spawn({
+        let transcript_file = transcript_file.clone();
+        move || -> Result<(), String> {
+            let mut client = AgentClient::with_config(AgentClientConfig {
+                protocol_file,
+                transcript_file: Some(transcript_file),
+                ..Default::default()
+            })
+            .map_err(|error| error.to_string())?;
+            client.window_info().map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    });
+    for _ in 0..100 {
+        app.update();
+        if client.is_finished() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    client
+        .join()
+        .expect("client thread")
+        .expect("client request");
+
+    let transcript = fs::read_to_string(&transcript_file).expect("transcript");
+    assert!(transcript.contains("window_info"));
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
 
@@ -240,6 +433,18 @@ fn temp_root(name: &str) -> PathBuf {
     ))
 }
 
+fn heartbeat_path(config: &AgentFeedbackConfig) -> PathBuf {
+    let protocol: Value = serde_json::from_slice(
+        &fs::read(&config.protocol_file).expect("protocol file should be written"),
+    )
+    .expect("protocol file should be JSON");
+    PathBuf::from(
+        protocol["heartbeat_file"]
+            .as_str()
+            .expect("protocol should expose heartbeat file"),
+    )
+}
+
 fn connect(config: &AgentFeedbackConfig) -> TcpStream {
     let protocol: Value = serde_json::from_slice(
         &fs::read(&config.protocol_file).expect("protocol file should be written"),
@@ -253,6 +458,21 @@ fn connect(config: &AgentFeedbackConfig) -> TcpStream {
     .expect("agent socket should accept local connections");
     stream.set_nonblocking(true).expect("nonblocking stream");
     stream
+}
+
+fn send_raw(stream: &mut TcpStream, request: &str) {
+    writeln!(stream, "{request}").expect("send agent command");
+}
+
+fn send(app: &mut App, stream: &mut TcpStream, request: &str) -> Value {
+    send_raw(stream, request);
+    read_response_while_updating(app, stream)
+}
+
+fn send_ok(app: &mut App, stream: &mut TcpStream, request: &str) -> Value {
+    let response = send(app, stream, request);
+    assert_eq!(response["ok"], Value::Bool(true));
+    response
 }
 
 fn read_response_while_updating(app: &mut App, stream: &mut TcpStream) -> Value {

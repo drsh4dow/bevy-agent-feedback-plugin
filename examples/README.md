@@ -1,38 +1,39 @@
 # Examples
 
-These examples show how Pi/Codex can discover and drive an instrumented Bevy app.
+These examples show how Pi/Codex can discover and drive an instrumented Bevy app with protocol v2.
 
 ## `minimal`
 
-Run the app:
+Run directly:
 
 ```sh
 cargo run --example minimal
 ```
 
-Then ask Pi/Codex to:
+Or let the wrapper own lifecycle and artifacts:
 
-1. read `target/agent-feedback/examples/minimal/agent-feedback.json`,
-2. connect to `socket_addr`,
-3. send `window_info`, `cursor_move`, `mouse_down`, `wait`, `mouse_up`, `key_down KeyW`, `capture`, and `key_up` as needed,
-4. report the PNG path from the capture response.
+```sh
+cargo run --bin bevy-feedback -- run -- cargo run --example minimal
+```
+
+Then drive `target/agent-feedback/examples/minimal/agent-feedback.json` (or `$BEVY_FEEDBACK_PROTOCOL` under the wrapper). Useful commands: `window_info`, `capture`, `click`, `drag`, `scroll`, `key_tap`, `key_hold`, `release_all_inputs`, `shutdown`.
 
 The blue sphere moves when `KeyW` is held.
 
 ## `agent_driven`
 
-Run the self-driving demo:
-
 ```sh
 cargo run --example agent_driven
 ```
 
-The example starts Bevy, reads its own protocol file, connects as an agent, sends input, captures before/after PNGs, prints their paths, then exits.
+The example starts Bevy, uses the Rust `AgentClient`, waits, captures before/after PNGs, holds `KeyW`, prints capture paths, then exits.
 
-## Headless Environments
+## Headless/CI
 
-Windowed examples need `DISPLAY` or `WAYLAND_DISPLAY` on Linux. Use this for compile-only validation:
+Windowed examples need `DISPLAY` or `WAYLAND_DISPLAY` on Linux. Use compile-only validation when no display is available:
 
 ```sh
 cargo check --examples
 ```
+
+For rendered CI, see `docs/ci-linux.md`.

@@ -5,12 +5,9 @@ use bevy::{
     window::{ExitCondition, WindowResolution},
     winit::WinitPlugin,
 };
-use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin};
-use serde_json::Value;
+use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin, client::AgentClient};
 use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
-    net::{SocketAddr, TcpStream},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -29,10 +26,16 @@ struct DemoResult {
 fn main() {
     let config = AgentFeedbackConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        protocol_file: PathBuf::from(
-            "target/agent-feedback/examples/agent-driven/agent-feedback.json",
-        ),
-        capture_dir: PathBuf::from("target/agent-feedback/examples/agent-driven/captures"),
+        protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from("target/agent-feedback/examples/agent-driven/agent-feedback.json")
+            }),
+        capture_dir: std::env::var_os("BEVY_FEEDBACK_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from("target/agent-feedback/examples/agent-driven/captures")
+            }),
         max_wait_frames: 600,
         command_timeout: Duration::from_secs(30),
         ..Default::default()
@@ -142,87 +145,15 @@ fn finish_when_agent_done(
 }
 
 fn drive_agent(protocol_file: &Path) -> Result<(), String> {
-    let socket_addr = read_socket_addr(protocol_file)?;
-    let (mut stream, mut reader) = connect(socket_addr)?;
+    let mut client = AgentClient::connect(protocol_file).map_err(|error| error.to_string())?;
+    client.wait(10).map_err(|error| error.to_string())?;
+    let before = client.capture().map_err(|error| error.to_string())?;
+    println!("before capture: {}", before.path.display());
 
-    send_request(
-        &mut stream,
-        &mut reader,
-        r#"{"id":1,"command":"wait","frames":10}"#,
-    )?;
-    let before = send_request(&mut stream, &mut reader, r#"{"id":2,"command":"capture"}"#)?;
-    println!("before capture: {}", capture_path(&before)?);
-
-    send_request(
-        &mut stream,
-        &mut reader,
-        r#"{"id":3,"command":"key_down","key":"KeyW"}"#,
-    )?;
-    send_request(
-        &mut stream,
-        &mut reader,
-        r#"{"id":4,"command":"wait","frames":45}"#,
-    )?;
-    let after = send_request(&mut stream, &mut reader, r#"{"id":5,"command":"capture"}"#)?;
-    println!("after capture: {}", capture_path(&after)?);
-
-    send_request(
-        &mut stream,
-        &mut reader,
-        r#"{"id":6,"command":"key_up","key":"KeyW"}"#,
-    )?;
+    client
+        .key_hold("KeyW", 45)
+        .map_err(|error| error.to_string())?;
+    let after = client.capture().map_err(|error| error.to_string())?;
+    println!("after capture: {}", after.path.display());
     Ok(())
-}
-
-fn read_socket_addr(protocol_file: &Path) -> Result<SocketAddr, String> {
-    let protocol: Value = serde_json::from_slice(
-        &fs::read(protocol_file).map_err(|error| format!("read protocol file: {error}"))?,
-    )
-    .map_err(|error| format!("parse protocol file: {error}"))?;
-
-    protocol["socket_addr"]
-        .as_str()
-        .ok_or_else(|| format!("protocol file missing socket_addr: {protocol}"))?
-        .parse()
-        .map_err(|error| format!("parse socket address: {error}"))
-}
-
-fn connect(socket_addr: SocketAddr) -> Result<(TcpStream, BufReader<TcpStream>), String> {
-    let stream = TcpStream::connect(socket_addr).map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| error.to_string())?;
-    let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
-    Ok((stream, BufReader::new(reader_stream)))
-}
-
-fn send_request(
-    stream: &mut TcpStream,
-    reader: &mut BufReader<TcpStream>,
-    request: &str,
-) -> Result<Value, String> {
-    writeln!(stream, "{request}").map_err(|error| error.to_string())?;
-
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| error.to_string())?;
-    if line.is_empty() {
-        return Err("agent socket closed before response".to_string());
-    }
-
-    let response: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
-    if response["ok"] != Value::Bool(true) {
-        return Err(format!("agent command failed: {response}"));
-    }
-    Ok(response)
-}
-
-fn capture_path(response: &Value) -> Result<&str, String> {
-    response["result"]["capture"]["path"]
-        .as_str()
-        .ok_or_else(|| format!("capture response did not include a path: {response}"))
 }
