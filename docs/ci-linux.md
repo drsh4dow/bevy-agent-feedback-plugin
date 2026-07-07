@@ -48,20 +48,20 @@ export WGPU_BACKEND=vulkan   # or gl
 
 ## Artifacts to upload
 
-Upload `target/agent-feedback` (or `$AGENT_FEEDBACK_ARTIFACT_ROOT`) on failure and success when useful. It contains:
+Upload `target/agent-feedback` (or `$BEVY_FEEDBACK_ARTIFACTS` when set) on failure and success when useful. Wrapper run artifacts include:
 
-- protocol/session copy
-- heartbeat metadata
-- game logs
-- replayable transcript with responses/timing
-- captures/screenshots
-- failure summary from `bevy-feedback run`
+- `game.log`
+- `protocol.json`
+- `transcript.jsonl`
+- live `captures/`
+- final copied `screenshots/`
+- `failure-summary.txt` on wrapper failures
 
 ## Wrapper example
 
 ```sh
 xvfb-run -s '-screen 0 1280x720x24' \
-  cargo run --bin bevy-feedback -- run \
+  cargo run --bin bevy-feedback -- run --ready-timeout 180000 \
   --game cargo run --example minimal \
   --driver python3 my_driver.py
 ```

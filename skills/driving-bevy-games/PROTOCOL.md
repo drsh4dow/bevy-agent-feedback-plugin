@@ -36,8 +36,7 @@ Request: `{"id": <any>, "command": "<name>", ...params}`. `id` echoes back;
 clients auto-assign if omitted.
 
 Success: `{"id":.., "ok":true, "result":{...}}`
-Error: `{"id":.., "ok":false, "error":{"code":.., "message":..}}` — malformed
-requests may return `"id": null`.
+Error: `{"id":.., "ok":false, "error":{"code":.., "message":..}}` — malformed JSON returns `"id": null`; syntactically valid request validation errors preserve the request `id`.
 
 `result` may carry:
 
@@ -47,8 +46,9 @@ requests may return `"id": null`.
   `mouse_position` `[x,y]`, `pressed_keys[]`, `pressed_buttons[]`.
 - `details` — diagnostics payload.
 
-`window`: `logical_width/height`, `physical_width/height`, `scale_factor`,
-optional `cursor_position [x,y]`.
+`mouse_position` is the agent logical cursor. `window`: `logical_width/height`,
+`physical_width/height`, `scale_factor`, optional OS-reported
+`cursor_position [x,y]`.
 
 ### Error codes
 
@@ -69,7 +69,7 @@ frames. Held input (`key_down`, `mouse_down`) persists until released or
 |---|---|---|
 | `key_down` / `key_up` | `key` | physical `KeyCode` name (below), case-insensitive |
 | `mouse_down` / `mouse_up` | `button` | `MouseButton` name, case-insensitive |
-| `cursor_move` | `x`, `y` | move cursor to logical position |
+| `cursor_move` | `x`, `y` | synthesize Bevy cursor movement to an agent logical position |
 | `mouse_motion` | `dx`, `dy` | raw motion delta |
 | `mouse_scroll` | `y`, `x?`=0, `unit?` | `unit`: `Line` (default) or `Pixel` |
 | `text` | `value` | UTF-8 committed via Bevy IME |
@@ -103,11 +103,13 @@ Require the plugin's `diagnostics` cargo feature **and**
 
 | command | result (`details`) |
 |---|---|
-| `ecs_summary` | `entity_count`, `component_count`, `archetype_count` |
-| `list_entities` | `entities:[{entity, components[]}]`, `total`, `truncated` (cap 256) |
-| `camera_info` | `cameras:[{entity, is_active, order, viewport, translation, projection}]`, `total`, `truncated` (cap 32) |
+| `ecs_summary` | `entity_count`, optional `entity_count_is_lower_bound`, `component_count`, `archetype_count` |
+| `list_entities` | `entities:[{entity, components[]}]`, `total`, `truncated`, optional `total_is_lower_bound` (cap 256) |
+| `camera_info` | `cameras:[{entity, is_active, order, viewport, translation, projection}]`, `total`, `truncated`, optional `total_is_lower_bound` (cap 32) |
 | `state_info` | `states[]` — only types registered via `.with_state::<S>()` |
-| `marker_info` | `markers:[{name, count, entities[], truncated}]` — only types registered via `.with_marker::<T>()` |
+| `marker_info` | `markers:[{name, count, entities[], truncated, count_is_lower_bound?}]` — only types registered via `.with_marker::<T>()` |
+
+When `truncated` is true, `total`/`count`/`entity_count` may be a lower bound instead of an exact full-world scan. The corresponding `*_is_lower_bound` field is present only in that case.
 
 ## Limits
 
@@ -138,3 +140,5 @@ retained captures 32 (older PNGs pruned).
   `MediaPlayPause`, `AudioVolumeUp`/`Down`/`Mute`, and more.
 
 An invalid name returns `invalid_request` with a "did you mean" suggestion.
+
+On Wayland, cursor commands do not require OS cursor warping; the plugin writes Bevy cursor events and reports the agent logical cursor in `mouse_position`.

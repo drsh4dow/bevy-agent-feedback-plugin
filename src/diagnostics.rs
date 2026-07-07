@@ -10,7 +10,13 @@ const MAX_DIAGNOSTIC_ENTITIES: usize = 256;
 const MAX_DIAGNOSTIC_CAMERAS: usize = 32;
 
 type StateReader = fn(&World) -> Option<Value>;
-type MarkerReader = fn(&mut World) -> (usize, Vec<Entity>);
+type MarkerReader = fn(&mut World) -> BoundedEntityList;
+
+struct BoundedEntityList {
+    total: usize,
+    total_is_lower_bound: bool,
+    entities: Vec<Entity>,
+}
 
 #[derive(Clone)]
 struct MarkerDiagnostic {
@@ -107,38 +113,53 @@ fn answer_diagnostics(world: &mut World) {
 }
 
 fn ecs_summary(world: &World) -> Value {
-    json!({
-        "entity_count": world.iter_entities().count(),
+    let entities = bounded_entities(
+        world.iter_entities().map(|entity_ref| entity_ref.id()),
+        MAX_DIAGNOSTIC_ENTITIES,
+    );
+    let mut result = json!({
+        "entity_count": entities.total,
         "component_count": world.components().iter_registered().count(),
         "archetype_count": world.archetypes().len(),
-    })
+    });
+    if entities.total_is_lower_bound {
+        result["entity_count_is_lower_bound"] = Value::Bool(true);
+    }
+    result
 }
 
 fn list_entities(world: &World) -> Value {
+    let bounded = bounded_entities(
+        world.iter_entities().map(|entity_ref| entity_ref.id()),
+        MAX_DIAGNOSTIC_ENTITIES,
+    );
     let components = world.components();
-    let mut entities = Vec::new();
-    let mut total = 0usize;
-    for entity in world.iter_entities() {
-        total += 1;
-        if entities.len() >= MAX_DIAGNOSTIC_ENTITIES {
-            continue;
-        }
-        let names = entity
-            .archetype()
-            .iter_components()
-            .filter_map(|id| components.get_info(id))
-            .map(|info| info.name().to_string())
-            .collect::<Vec<_>>();
-        entities.push(json!({
-            "entity": format!("{:?}", entity.id()),
-            "components": names,
-        }));
-    }
-    json!({
+    let entities = bounded
+        .entities
+        .iter()
+        .map(|entity| {
+            let entity_ref = world.entity(*entity);
+            let names = entity_ref
+                .archetype()
+                .iter_components()
+                .filter_map(|id| components.get_info(id))
+                .map(|info| info.name().to_string())
+                .collect::<Vec<_>>();
+            json!({
+                "entity": format!("{entity:?}"),
+                "components": names,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
         "entities": entities,
-        "total": total,
-        "truncated": total > MAX_DIAGNOSTIC_ENTITIES,
-    })
+        "total": bounded.total,
+        "truncated": bounded.total_is_lower_bound,
+    });
+    if bounded.total_is_lower_bound {
+        result["total_is_lower_bound"] = Value::Bool(true);
+    }
+    result
 }
 
 fn camera_info(world: &mut World) -> Value {
@@ -150,11 +171,14 @@ fn camera_info(world: &mut World) -> Value {
     )>();
     let mut cameras = Vec::new();
     let mut total = 0usize;
+    let mut total_is_lower_bound = false;
     for (entity, camera, transform, projection) in query.iter(world) {
-        total += 1;
         if cameras.len() >= MAX_DIAGNOSTIC_CAMERAS {
-            continue;
+            total = MAX_DIAGNOSTIC_CAMERAS + 1;
+            total_is_lower_bound = true;
+            break;
         }
+        total += 1;
         let translation = transform.map(|transform| transform.translation().to_array());
         cameras.push(json!({
             "entity": format!("{:?}", entity),
@@ -168,11 +192,15 @@ fn camera_info(world: &mut World) -> Value {
             "projection": projection.map(|projection| format!("{projection:?}")),
         }));
     }
-    json!({
+    let mut result = json!({
         "cameras": cameras,
         "total": total,
-        "truncated": total > MAX_DIAGNOSTIC_CAMERAS,
-    })
+        "truncated": total_is_lower_bound,
+    });
+    if total_is_lower_bound {
+        result["total_is_lower_bound"] = Value::Bool(true);
+    }
+    result
 }
 
 fn state_info(world: &World, readers: &[StateReader]) -> Value {
@@ -187,16 +215,21 @@ fn marker_info(world: &mut World, readers: &[MarkerDiagnostic]) -> Value {
     let markers = readers
         .iter()
         .map(|marker| {
-            let (total, entities) = (marker.reader)(world);
-            json!({
+            let bounded = (marker.reader)(world);
+            let mut result = json!({
                 "name": marker.name,
-                "count": total,
-                "entities": entities
+                "count": bounded.total,
+                "entities": bounded
+                    .entities
                     .iter()
                     .map(|entity| format!("{entity:?}"))
                     .collect::<Vec<_>>(),
-                "truncated": total > MAX_DIAGNOSTIC_ENTITIES,
-            })
+                "truncated": bounded.total_is_lower_bound,
+            });
+            if bounded.total_is_lower_bound {
+                result["count_is_lower_bound"] = Value::Bool(true);
+            }
+            result
         })
         .collect::<Vec<_>>();
     json!({ "markers": markers })
@@ -210,17 +243,30 @@ fn read_state<S: States>(world: &World) -> Option<Value> {
     }))
 }
 
-fn read_marker<T: Component>(world: &mut World) -> (usize, Vec<Entity>) {
+fn read_marker<T: Component>(world: &mut World) -> BoundedEntityList {
     let mut query = world.query_filtered::<Entity, With<T>>();
-    let mut total = 0usize;
+    bounded_entities(query.iter(world), MAX_DIAGNOSTIC_ENTITIES)
+}
+
+fn bounded_entities(iter: impl Iterator<Item = Entity>, cap: usize) -> BoundedEntityList {
     let mut entities = Vec::new();
-    for entity in query.iter(world) {
-        total += 1;
-        if entities.len() < MAX_DIAGNOSTIC_ENTITIES {
-            entities.push(entity);
+    let mut total = 0usize;
+    for entity in iter {
+        if entities.len() >= cap {
+            return BoundedEntityList {
+                total: cap + 1,
+                total_is_lower_bound: true,
+                entities,
+            };
         }
+        total += 1;
+        entities.push(entity);
     }
-    (total, entities)
+    BoundedEntityList {
+        total,
+        total_is_lower_bound: false,
+        entities,
+    }
 }
 
 fn short_type_name<T>() -> String {
@@ -251,7 +297,35 @@ mod tests {
     struct TestMarker;
 
     #[test]
-    fn marker_info_preserves_total_count_when_entity_list_is_capped() {
+    fn bounded_entities_reports_exact_count_below_cap() {
+        let mut app = App::new();
+        let entities = (0..3)
+            .map(|_| app.world_mut().spawn_empty().id())
+            .collect::<Vec<_>>();
+
+        let bounded = bounded_entities(entities.iter().copied(), 4);
+
+        assert_eq!(bounded.total, 3);
+        assert!(!bounded.total_is_lower_bound);
+        assert_eq!(bounded.entities, entities);
+    }
+
+    #[test]
+    fn bounded_entities_reports_lower_bound_above_cap() {
+        let mut app = App::new();
+        let entities = (0..3)
+            .map(|_| app.world_mut().spawn_empty().id())
+            .collect::<Vec<_>>();
+
+        let bounded = bounded_entities(entities.iter().copied(), 2);
+
+        assert_eq!(bounded.total, 3);
+        assert!(bounded.total_is_lower_bound);
+        assert_eq!(bounded.entities.as_slice(), &entities[..2]);
+    }
+
+    #[test]
+    fn marker_info_reports_lower_bound_when_entity_list_is_capped() {
         let mut app = App::new();
         app.add_plugins(AgentFeedbackDiagnosticsPlugin::default().with_marker::<TestMarker>());
         for _ in 0..MAX_DIAGNOSTIC_ENTITIES + 1 {
@@ -266,15 +340,69 @@ mod tests {
             .clone();
         let result = marker_info(app.world_mut(), &marker_readers);
         let marker = &result["markers"][0];
-        let count = marker["count"].as_u64().expect("marker count");
         let entities = marker["entities"].as_array().expect("entities");
         assert_eq!(marker["name"], "TestMarker");
-        assert_eq!(count, (MAX_DIAGNOSTIC_ENTITIES + 1) as u64);
-        assert_eq!(entities.len(), MAX_DIAGNOSTIC_ENTITIES);
-        assert!(
-            count > entities.len() as u64,
-            "marker_info must keep the full count when capping entity details"
+        assert_eq!(
+            marker["count"].as_u64().expect("marker count"),
+            (MAX_DIAGNOSTIC_ENTITIES + 1) as u64
         );
+        assert_eq!(marker["count_is_lower_bound"], Value::Bool(true));
         assert_eq!(marker["truncated"], Value::Bool(true));
+        assert_eq!(entities.len(), MAX_DIAGNOSTIC_ENTITIES);
+    }
+
+    #[test]
+    fn ecs_summary_reports_entity_lower_bound_when_capped() {
+        let mut app = App::new();
+        for _ in 0..MAX_DIAGNOSTIC_ENTITIES + 1 {
+            app.world_mut().spawn_empty();
+        }
+
+        let summary = ecs_summary(app.world());
+
+        assert_eq!(
+            summary["entity_count"].as_u64().expect("entity count"),
+            (MAX_DIAGNOSTIC_ENTITIES + 1) as u64
+        );
+        assert_eq!(summary["entity_count_is_lower_bound"], Value::Bool(true));
+    }
+
+    #[test]
+    fn list_entities_reports_lower_bound_when_capped() {
+        let mut app = App::new();
+        for _ in 0..MAX_DIAGNOSTIC_ENTITIES + 1 {
+            app.world_mut().spawn_empty();
+        }
+
+        let result = list_entities(app.world());
+        let entities = result["entities"].as_array().expect("entities");
+
+        assert_eq!(
+            result["total"].as_u64().expect("entity total"),
+            (MAX_DIAGNOSTIC_ENTITIES + 1) as u64
+        );
+        assert_eq!(result["total_is_lower_bound"], Value::Bool(true));
+        assert_eq!(result["truncated"], Value::Bool(true));
+        assert_eq!(entities.len(), MAX_DIAGNOSTIC_ENTITIES);
+    }
+
+    #[test]
+    fn camera_info_reports_lower_bound_when_capped() {
+        let mut app = App::new();
+        for _ in 0..MAX_DIAGNOSTIC_CAMERAS + 1 {
+            app.world_mut()
+                .spawn((Camera::default(), Transform::default()));
+        }
+
+        let result = camera_info(app.world_mut());
+        let cameras = result["cameras"].as_array().expect("cameras");
+
+        assert_eq!(
+            result["total"].as_u64().expect("camera total"),
+            (MAX_DIAGNOSTIC_CAMERAS + 1) as u64
+        );
+        assert_eq!(result["total_is_lower_bound"], Value::Bool(true));
+        assert_eq!(result["truncated"], Value::Bool(true));
+        assert_eq!(cameras.len(), MAX_DIAGNOSTIC_CAMERAS);
     }
 }

@@ -15,4 +15,4 @@ if len(sys.argv) > 2:
     raise SystemExit("usage: drive.py [PROTOCOL_FILE] < commands.jsonl")
 
 protocol = sys.argv[1] if len(sys.argv) == 2 else None
-drive_stdio(protocol, sys.stdin)
+raise SystemExit(drive_stdio(protocol, sys.stdin))

@@ -414,13 +414,42 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-def drive_stdio(protocol_file: str | os.PathLike[str], lines: Iterable[str]) -> None:
+def drive_stdio(protocol_file: str | os.PathLike[str], lines: Iterable[str]) -> int:
     """Compatibility helper: stdin JSON-lines to stdout JSON-lines."""
+    failed = False
     with BevyFeedbackClient(protocol_file) as client:
         for line_number, line in enumerate(lines, 1):
             line = line.strip()
             if not line:
                 continue
-            command = json.loads(line)
+            try:
+                command = json.loads(line)
+            except json.JSONDecodeError as error:
+                failed = True
+                print(
+                    json.dumps(
+                        {
+                            "id": None,
+                            "ok": False,
+                            "error": {
+                                "code": "invalid_json",
+                                "message": f"line {line_number}: {error}",
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+                continue
             command.setdefault("id", line_number)
-            print(json.dumps(client.request(command), separators=(",", ":")), flush=True)
+            try:
+                response = client.request(command)
+            except BevyFeedbackError as error:
+                failed = True
+                response = {
+                    "id": command.get("id", line_number),
+                    "ok": False,
+                    "error": {"code": "client_error", "message": str(error)},
+                }
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+    return 1 if failed else 0

@@ -70,6 +70,7 @@ mod config;
 mod control;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
+mod key_names;
 mod protocol;
 mod runtime;
 mod session;

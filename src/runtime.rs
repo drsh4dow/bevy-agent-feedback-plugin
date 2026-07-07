@@ -235,7 +235,7 @@ fn handle_line(
         Err(error) => {
             return write_response(
                 stream,
-                &AgentResponse::error(Value::Null, "invalid_request", error),
+                &AgentResponse::error(error.id, "invalid_request", error.message),
             );
         }
     };

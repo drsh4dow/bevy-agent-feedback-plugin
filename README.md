@@ -77,19 +77,40 @@ Window {
 
 ## Drive it
 
+Manual wrapper:
+
 ```sh
 cargo run --bin bevy-feedback -- run -- cargo run --example minimal
 ```
 
-With a separate driver:
+Recommended automated mode:
 
 ```sh
-cargo run --bin bevy-feedback -- run \
+cargo run --bin bevy-feedback -- run --ready-timeout 180000 \
   --game cargo run --example minimal \
   --driver python3 my_driver.py
 ```
 
-The wrapper exports the protocol/capture/artifact paths, waits for readiness, streams logs, releases inputs, sends `shutdown`, and writes artifacts including a replayable JSONL transcript with responses/timing.
+The wrapper exports the protocol/capture/artifact paths, waits for readiness, streams logs, releases inputs, sends `shutdown`, and writes artifacts. Timeout flags use milliseconds and can also come from environment variables:
+
+| flag | env | default |
+|---|---|---|
+| `--ready-timeout MS` | `BEVY_FEEDBACK_READY_TIMEOUT_MS` | `60000` |
+| `--driver-timeout MS` | `BEVY_FEEDBACK_DRIVER_TIMEOUT_MS` | `300000` |
+| `--shutdown-timeout MS` | `BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS` | `5000` |
+
+Artifacts from `bevy-feedback run`:
+
+| path | purpose |
+|---|---|
+| `game.log` | game stdout/stderr |
+| `protocol.json` | copied protocol/session metadata |
+| `transcript.jsonl` | replayable request/response/timing envelopes |
+| `captures/` | live capture PNGs |
+| `screenshots/` | final copied PNGs for upload |
+| `failure-summary.txt` | failure reason, log tail, newest capture |
+
+`--game ... --driver ...` is the best mode for automation because the driver receives `BEVY_FEEDBACK_TRANSCRIPT`, so client commands are recorded in `transcript.jsonl`.
 
 Raw JSON-lines also works:
 
@@ -132,4 +153,4 @@ app.add_plugins(
 
 ## CI
 
-See [`docs/ci-linux.md`](docs/ci-linux.md). Windowed captures need a display (`DISPLAY`, `WAYLAND_DISPLAY`, or `xvfb-run`).
+See [`docs/ci-linux.md`](docs/ci-linux.md) for the headless `xvfb-run` recipe and artifact upload path. Windowed captures need a display (`DISPLAY`, `WAYLAND_DISPLAY`, or `xvfb-run`).

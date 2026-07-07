@@ -1,5 +1,6 @@
 use crate::{
     config::AgentFeedbackConfig,
+    key_names::KEY_CODE_NAMES,
     session::{AgentFeedbackSession, PROTOCOL_VERSION},
 };
 use bevy::{input::mouse::MouseScrollUnit, prelude::*};
@@ -111,6 +112,12 @@ pub(crate) struct AgentSnapshot {
 pub(crate) struct AgentRequestBody {
     pub(crate) id: Value,
     pub(crate) command: AgentCommand,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParseRequestError {
+    pub(crate) id: Value,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,9 +305,36 @@ pub(crate) fn parse_request(
     line: &str,
     max_wait_frames: u16,
     max_action_steps: u16,
-) -> Result<AgentRequestBody, String> {
-    let request: WireRequest = serde_json::from_str(line).map_err(|error| error.to_string())?;
-    let command = match request.command {
+) -> Result<AgentRequestBody, ParseRequestError> {
+    let value = serde_json::from_str::<Value>(line).map_err(|error| ParseRequestError {
+        id: Value::Null,
+        message: error.to_string(),
+    })?;
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
+    let request =
+        serde_json::from_value::<WireRequest>(value).map_err(|error| ParseRequestError {
+            id,
+            message: error.to_string(),
+        })?;
+    let command = parse_wire_command(request.command, max_wait_frames, max_action_steps).map_err(
+        |message| ParseRequestError {
+            id: request.id.clone(),
+            message,
+        },
+    )?;
+
+    Ok(AgentRequestBody {
+        id: request.id,
+        command,
+    })
+}
+
+fn parse_wire_command(
+    command: WireCommand,
+    max_wait_frames: u16,
+    max_action_steps: u16,
+) -> Result<AgentCommand, String> {
+    let command = match command {
         WireCommand::KeyDown { key } => AgentCommand::KeyDown(parse_key_code(&key)?),
         WireCommand::KeyUp { key } => AgentCommand::KeyUp(parse_key_code(&key)?),
         WireCommand::MouseDown { button } => AgentCommand::MouseDown(parse_mouse_button(&button)?),
@@ -375,10 +409,7 @@ pub(crate) fn parse_request(
         WireCommand::MarkerInfo => AgentCommand::MarkerInfo,
     };
 
-    Ok(AgentRequestBody {
-        id: request.id,
-        command,
-    })
+    Ok(command)
 }
 
 fn vec2(label: &str, x: f32, y: f32) -> Result<Vec2, String> {
@@ -414,12 +445,16 @@ fn parse_scroll_unit(value: Option<&str>) -> Result<MouseScrollUnit, String> {
 fn parse_named<T: DeserializeOwned>(kind: &str, value: &str, names: &[&str]) -> Result<T, String> {
     let Some(name) = names.iter().find(|name| name.eq_ignore_ascii_case(value)) else {
         let value_lower = value.to_ascii_lowercase();
-        if !value_lower.is_empty()
-            && let Some(suggestion) = names.iter().find(|name| {
-                let name_lower = name.to_ascii_lowercase();
-                name_lower.starts_with(&value_lower) || value_lower.starts_with(&name_lower)
-            })
-        {
+        let mut best = None;
+        for name in names {
+            let name_lower = name.to_ascii_lowercase();
+            if let Some(distance) = edit_distance_with_cutoff(&value_lower, &name_lower, 2)
+                && best.is_none_or(|(best_distance, _)| distance < best_distance)
+            {
+                best = Some((distance, *name));
+            }
+        }
+        if let Some((_, suggestion)) = best {
             return Err(format!(
                 "invalid {kind} '{value}'; did you mean '{suggestion}'?"
             ));
@@ -428,6 +463,33 @@ fn parse_named<T: DeserializeOwned>(kind: &str, value: &str, names: &[&str]) -> 
     };
     serde_json::from_value(Value::String((*name).to_string()))
         .map_err(|error| format!("invalid {kind} '{value}'; did you mean '{name}'? ({error})"))
+}
+
+fn edit_distance_with_cutoff(left: &str, right: &str, cutoff: usize) -> Option<usize> {
+    if left.len().abs_diff(right.len()) > cutoff {
+        return None;
+    }
+
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.bytes().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_minimum = current[0];
+        for (right_index, right_byte) in right.bytes().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_byte != right_byte);
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            let distance = substitution.min(insertion).min(deletion);
+            current[right_index + 1] = distance;
+            row_minimum = row_minimum.min(distance);
+        }
+        if row_minimum > cutoff {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    (previous[right.len()] <= cutoff).then_some(previous[right.len()])
 }
 
 pub(crate) fn write_protocol_file(
@@ -506,203 +568,6 @@ pub(crate) fn write_protocol_file(
 
 const MOUSE_BUTTON_NAMES: &[&str] = &["Left", "Right", "Middle", "Back", "Forward"];
 const MOUSE_SCROLL_UNIT_NAMES: &[&str] = &["Line", "Pixel"];
-const KEY_CODE_NAMES: &[&str] = &[
-    "Backquote",
-    "Backslash",
-    "BracketLeft",
-    "BracketRight",
-    "Comma",
-    "Digit0",
-    "Digit1",
-    "Digit2",
-    "Digit3",
-    "Digit4",
-    "Digit5",
-    "Digit6",
-    "Digit7",
-    "Digit8",
-    "Digit9",
-    "Equal",
-    "IntlBackslash",
-    "IntlRo",
-    "IntlYen",
-    "KeyA",
-    "KeyB",
-    "KeyC",
-    "KeyD",
-    "KeyE",
-    "KeyF",
-    "KeyG",
-    "KeyH",
-    "KeyI",
-    "KeyJ",
-    "KeyK",
-    "KeyL",
-    "KeyM",
-    "KeyN",
-    "KeyO",
-    "KeyP",
-    "KeyQ",
-    "KeyR",
-    "KeyS",
-    "KeyT",
-    "KeyU",
-    "KeyV",
-    "KeyW",
-    "KeyX",
-    "KeyY",
-    "KeyZ",
-    "Minus",
-    "Period",
-    "Quote",
-    "Semicolon",
-    "Slash",
-    "AltLeft",
-    "AltRight",
-    "Backspace",
-    "CapsLock",
-    "ContextMenu",
-    "ControlLeft",
-    "ControlRight",
-    "Enter",
-    "SuperLeft",
-    "SuperRight",
-    "ShiftLeft",
-    "ShiftRight",
-    "Space",
-    "Tab",
-    "Convert",
-    "KanaMode",
-    "Lang1",
-    "Lang2",
-    "Lang3",
-    "Lang4",
-    "Lang5",
-    "NonConvert",
-    "Delete",
-    "End",
-    "Help",
-    "Home",
-    "Insert",
-    "PageDown",
-    "PageUp",
-    "ArrowDown",
-    "ArrowLeft",
-    "ArrowRight",
-    "ArrowUp",
-    "NumLock",
-    "Numpad0",
-    "Numpad1",
-    "Numpad2",
-    "Numpad3",
-    "Numpad4",
-    "Numpad5",
-    "Numpad6",
-    "Numpad7",
-    "Numpad8",
-    "Numpad9",
-    "NumpadAdd",
-    "NumpadBackspace",
-    "NumpadClear",
-    "NumpadClearEntry",
-    "NumpadComma",
-    "NumpadDecimal",
-    "NumpadDivide",
-    "NumpadEnter",
-    "NumpadEqual",
-    "NumpadHash",
-    "NumpadMemoryAdd",
-    "NumpadMemoryClear",
-    "NumpadMemoryRecall",
-    "NumpadMemoryStore",
-    "NumpadMemorySubtract",
-    "NumpadMultiply",
-    "NumpadParenLeft",
-    "NumpadParenRight",
-    "NumpadStar",
-    "NumpadSubtract",
-    "Escape",
-    "Fn",
-    "FnLock",
-    "PrintScreen",
-    "ScrollLock",
-    "Pause",
-    "BrowserBack",
-    "BrowserFavorites",
-    "BrowserForward",
-    "BrowserHome",
-    "BrowserRefresh",
-    "BrowserSearch",
-    "BrowserStop",
-    "Eject",
-    "LaunchApp1",
-    "LaunchApp2",
-    "LaunchMail",
-    "MediaPlayPause",
-    "MediaSelect",
-    "MediaStop",
-    "MediaTrackNext",
-    "MediaTrackPrevious",
-    "Power",
-    "Sleep",
-    "AudioVolumeDown",
-    "AudioVolumeMute",
-    "AudioVolumeUp",
-    "WakeUp",
-    "Meta",
-    "Hyper",
-    "Turbo",
-    "Abort",
-    "Resume",
-    "Suspend",
-    "Again",
-    "Copy",
-    "Cut",
-    "Find",
-    "Open",
-    "Paste",
-    "Props",
-    "Select",
-    "Undo",
-    "Hiragana",
-    "Katakana",
-    "F1",
-    "F2",
-    "F3",
-    "F4",
-    "F5",
-    "F6",
-    "F7",
-    "F8",
-    "F9",
-    "F10",
-    "F11",
-    "F12",
-    "F13",
-    "F14",
-    "F15",
-    "F16",
-    "F17",
-    "F18",
-    "F19",
-    "F20",
-    "F21",
-    "F22",
-    "F23",
-    "F24",
-    "F25",
-    "F26",
-    "F27",
-    "F28",
-    "F29",
-    "F30",
-    "F31",
-    "F32",
-    "F33",
-    "F34",
-    "F35",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,10 +605,28 @@ mod tests {
 
     #[test]
     fn invalid_names_suggest_close_values() {
-        let error = parse_request(r#"{"id":1,"command":"mouse_down","button":"righ"}"#, 10, 10)
-            .expect_err("invalid button");
+        let error = parse_request(
+            r#"{"id":1,"command":"mouse_down","button":"rigth"}"#,
+            10,
+            10,
+        )
+        .expect_err("invalid button");
+        assert_eq!(error.id, Value::from(1));
+        assert!(error.message.contains("Right"));
 
-        assert!(error.contains("Right"));
+        let error = parse_request(
+            r#"{"id":"bad-scroll","command":"scroll","lines":1,"unit":"lien"}"#,
+            10,
+            10,
+        )
+        .expect_err("invalid scroll unit");
+        assert_eq!(error.id, Value::from("bad-scroll"));
+        assert!(error.message.contains("Line"));
+
+        let error = parse_request(r#"{"id":3,"command":"key_tap","key":"keyww"}"#, 10, 10)
+            .expect_err("invalid key");
+        assert_eq!(error.id, Value::from(3));
+        assert!(error.message.contains("KeyW"));
     }
 
     #[test]
@@ -751,7 +634,8 @@ mod tests {
         let error = parse_request(r#"{"id":"slow","command":"wait","frames":11}"#, 10, 10)
             .expect_err("frame bound should be enforced");
 
-        assert!(error.contains("frames"));
+        assert_eq!(error.id, Value::from("slow"));
+        assert!(error.message.contains("frames"));
     }
 
     #[test]

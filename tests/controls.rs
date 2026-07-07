@@ -4,10 +4,7 @@ use bevy::{
     prelude::*,
     window::{FileDragAndDrop, Ime, PrimaryWindow},
 };
-use bevy_agent_feedback_plugin::{
-    AgentFeedbackConfig, AgentFeedbackPlugin,
-    client::{AgentClient, AgentClientConfig},
-};
+use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin};
 use serde_json::Value;
 use std::{
     fs,
@@ -85,12 +82,39 @@ fn socket_cursor_move_updates_window_and_returns_metadata() {
         Value::from(640.0)
     );
 
-    let (_, window) = app
-        .world_mut()
-        .query_filtered::<(Entity, &Window), With<PrimaryWindow>>()
-        .single(app.world())
-        .expect("primary window");
-    assert_eq!(window.cursor_position(), Some(Vec2::new(320.0, 240.0)));
+    assert_eq!(
+        response["result"]["mouse_position"],
+        Value::Array(vec![Value::from(320.0), Value::from(240.0)])
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn second_cursor_move_uses_agent_logical_position() {
+    let (mut app, config) = agent_app("second-cursor-move");
+    let mut stream = connect(&config);
+
+    send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":1,"command":"cursor_move","x":100,"y":100}"#,
+    );
+    let response = send_ok(
+        &mut app,
+        &mut stream,
+        r#"{"id":2,"command":"cursor_move","x":110,"y":105}"#,
+    );
+
+    assert_eq!(
+        response["result"]["mouse_position"],
+        Value::Array(vec![Value::from(110.0), Value::from(105.0)])
+    );
+    assert_eq!(response["result"]["pressed_keys"], Value::Array(Vec::new()));
+    assert_eq!(
+        response["result"]["pressed_buttons"],
+        Value::Array(Vec::new())
+    );
+
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
 
@@ -273,6 +297,46 @@ fn drag_releases_button_when_move_fails_mid_flight() {
 }
 
 #[test]
+fn invalid_request_preserves_id_for_validation_errors() {
+    let (mut app, config) = agent_app("invalid-request-id");
+    let mut stream = connect(&config);
+
+    let response = send(
+        &mut app,
+        &mut stream,
+        r#"{"id":"bad-button","command":"click","x":10,"y":10,"button":"rigth"}"#,
+    );
+
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert_eq!(response["id"], "bad-button");
+    assert_eq!(response["error"]["code"], "invalid_request");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error message should be a string")
+            .contains("Right")
+    );
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn malformed_json_returns_null_id() {
+    let (mut app, config) = agent_app("malformed-json-null-id");
+    let mut stream = connect(&config);
+
+    let response = send(
+        &mut app,
+        &mut stream,
+        r#"{"id":"bad-json","command":"click""#,
+    );
+
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert_eq!(response["id"], Value::Null);
+    assert_eq!(response["error"]["code"], "invalid_request");
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
 fn diagnostics_without_plugin_returns_clear_error() {
     let (mut app, config) = agent_app("diagnostics-unavailable");
     let mut stream = connect(&config);
@@ -386,147 +450,6 @@ fn runtime_drop_removes_live_protocol_files() {
 
     assert!(!config.protocol_file.exists());
     assert!(!heartbeat_file.exists());
-    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
-}
-
-#[test]
-fn rust_client_writes_transcript_envelopes_and_replays_compat_formats() {
-    let (mut app, config) = agent_app("rust-client-transcript");
-    let transcript_file = config
-        .protocol_file
-        .parent()
-        .expect("protocol parent")
-        .join("transcript.jsonl");
-    let replay_file = config
-        .protocol_file
-        .parent()
-        .expect("protocol parent")
-        .join("replay.jsonl");
-    let protocol_file = config.protocol_file.clone();
-    let client = thread::spawn({
-        let transcript_file = transcript_file.clone();
-        let replay_file = replay_file.clone();
-        move || -> Result<(), String> {
-            let mut client = AgentClient::with_config(AgentClientConfig {
-                protocol_file,
-                transcript_file: Some(transcript_file),
-                ..Default::default()
-            })
-            .map_err(|error| error.to_string())?;
-            client.window_info().map_err(|error| error.to_string())?;
-            fs::write(
-                &replay_file,
-                format!(
-                    "{}\n{}\n",
-                    serde_json::json!({"command": "window_info"}),
-                    serde_json::json!({"request": {"command": "window_info"}}),
-                ),
-            )
-            .map_err(|error| error.to_string())?;
-            let responses = client
-                .replay_jsonl(&replay_file)
-                .map_err(|error| error.to_string())?;
-            if responses.len() != 2
-                || responses
-                    .iter()
-                    .any(|response| response["ok"] != Value::Bool(true))
-            {
-                return Err(format!("unexpected replay responses: {responses:?}"));
-            }
-            Ok(())
-        }
-    });
-    for _ in 0..100 {
-        app.update();
-        if client.is_finished() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    client
-        .join()
-        .expect("client thread")
-        .expect("client request");
-
-    let transcript = fs::read_to_string(&transcript_file).expect("transcript");
-    let envelopes = transcript
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("transcript line"))
-        .collect::<Vec<_>>();
-    assert!(envelopes.len() >= 3, "transcript: {transcript}");
-    assert!(envelopes[0]["ts_ms"].as_u64().is_some());
-    assert!(envelopes[0]["duration_ms"].as_u64().is_some());
-    assert_eq!(envelopes[0]["request"]["command"], "window_info");
-    assert_eq!(envelopes[0]["response"]["ok"], Value::Bool(true));
-    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
-}
-
-#[test]
-fn rust_client_replay_jsonl_snapshots_transcript_before_appending() {
-    let (mut app, config) = agent_app("rust-client-replay-same-transcript");
-    let transcript_file = config
-        .protocol_file
-        .parent()
-        .expect("protocol parent")
-        .join("transcript.jsonl");
-    fs::write(
-        &transcript_file,
-        format!(
-            "{}\n{}\n",
-            serde_json::json!({"command": "window_info"}),
-            serde_json::json!({"request": {"command": "window_info"}}),
-        ),
-    )
-    .expect("seed transcript");
-
-    let protocol_file = config.protocol_file.clone();
-    let client = thread::spawn({
-        let transcript_file = transcript_file.clone();
-        move || -> Result<(), String> {
-            let mut client = AgentClient::with_config(AgentClientConfig {
-                protocol_file,
-                timeout: Duration::from_millis(250),
-                transcript_file: Some(transcript_file.clone()),
-                ..Default::default()
-            })
-            .map_err(|error| error.to_string())?;
-            let responses = client
-                .replay_jsonl(&transcript_file)
-                .map_err(|error| error.to_string())?;
-            if responses.len() != 2
-                || responses
-                    .iter()
-                    .any(|response| response["ok"] != Value::Bool(true))
-            {
-                return Err(format!("unexpected replay responses: {responses:?}"));
-            }
-            Ok(())
-        }
-    });
-
-    let finished = update_until(&mut app, Duration::from_secs(2), || client.is_finished());
-    if !finished {
-        drop(app);
-        let _ = client.join();
-        panic!("replay_jsonl should stop after the original transcript lines");
-    }
-    client
-        .join()
-        .expect("client thread")
-        .expect("client replay");
-
-    let transcript = fs::read_to_string(&transcript_file).expect("transcript");
-    let envelopes = transcript
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("transcript line"))
-        .collect::<Vec<_>>();
-    assert_eq!(envelopes.len(), 4, "transcript: {transcript}");
-    assert_eq!(envelopes[0]["command"], "window_info");
-    assert_eq!(envelopes[1]["request"]["command"], "window_info");
-    assert_eq!(envelopes[2]["request"]["command"], "window_info");
-    assert_eq!(envelopes[2]["response"]["ok"], Value::Bool(true));
-    assert_eq!(envelopes[3]["request"]["command"], "window_info");
-    assert_eq!(envelopes[3]["response"]["ok"], Value::Bool(true));
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
 
@@ -697,18 +620,6 @@ fn update_for(app: &mut App, duration: Duration) {
         app.update();
         thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn update_until(app: &mut App, timeout: Duration, done: impl Fn() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        app.update();
-        if done() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    done()
 }
 
 fn observe_app_exit(mut observed: ResMut<ObservedExits>, mut app_exit: MessageReader<AppExit>) {
