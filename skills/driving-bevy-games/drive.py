@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for the maintained Python client."""
+"""Stdin JSON-lines to stdout JSON-lines driver for bevy-agent-feedback v2.
+
+Self-contained: imports the bundled client next to this file, so the skill
+works when installed outside the source repository.
+"""
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "clients" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bevy_feedback import drive_stdio  # noqa: E402
 
-if len(sys.argv) != 2:
-    raise SystemExit("usage: drive.py PROTOCOL_FILE < commands.jsonl")
+if len(sys.argv) > 2:
+    raise SystemExit("usage: drive.py [PROTOCOL_FILE] < commands.jsonl")
 
-drive_stdio(sys.argv[1], sys.stdin)
+protocol = sys.argv[1] if len(sys.argv) == 2 else None
+drive_stdio(protocol, sys.stdin)
