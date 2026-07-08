@@ -32,9 +32,11 @@ jobs:
       - name: Install Linux display dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang mold xvfb libx11-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev libudev-dev pkg-config
+          sudo apt-get install -y clang mold xvfb mesa-vulkan-drivers libx11-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev libudev-dev pkg-config
       - run: rustup component add rustfmt clippy rustc-codegen-cranelift
       - name: Verify rendered agent feedback
+        env:
+          WGPU_BACKEND: vulkan
         run: xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
       - name: Upload agent feedback artifacts
         if: failure()

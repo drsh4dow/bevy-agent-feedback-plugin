@@ -8,7 +8,7 @@ Ubuntu-style baseline:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y clang mold xvfb libx11-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev libudev-dev pkg-config
+sudo apt-get install -y clang mold xvfb mesa-vulkan-drivers libx11-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev libudev-dev pkg-config
 # Optional OCR assertions:
 sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
 ```
@@ -27,7 +27,7 @@ cargo check --examples
 Rendered smoke:
 
 ```sh
-xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
+WGPU_BACKEND=vulkan xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
 ```
 
 Pin capture dimensions in examples/tests:
