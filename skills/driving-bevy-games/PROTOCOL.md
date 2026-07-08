@@ -57,6 +57,9 @@ suggestions), `line_too_long`, `queue_full`, `closed`, `timeout`,
 `missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`,
 `diagnostics_unavailable`, `socket_error`.
 
+`position_out_of_bounds` keeps code `position_out_of_bounds`; its message is
+`point [x,y] outside logical window WxH`.
+
 ## Commands
 
 Coordinates are logical pixels, origin top-left. `frames` counts rendered

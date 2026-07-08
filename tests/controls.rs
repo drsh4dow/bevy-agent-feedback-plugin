@@ -244,6 +244,10 @@ fn drag_rejects_out_of_bounds_target_before_pressing_button() {
 
     assert_eq!(response["ok"], Value::Bool(false));
     assert_eq!(response["error"]["code"], "position_out_of_bounds");
+    assert_eq!(
+        response["error"]["message"],
+        "point [999,10] outside logical window 640x480"
+    );
     assert!(
         !app.world()
             .resource::<ButtonInput<MouseButton>>()
@@ -288,6 +292,13 @@ fn drag_releases_button_when_move_fails_mid_flight() {
     let response = read_response_while_updating(&mut app, &mut stream);
     assert_eq!(response["ok"], Value::Bool(false));
     assert_eq!(response["error"]["code"], "position_out_of_bounds");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outside logical window 100x100")),
+        "{}",
+        response["error"]["message"]
+    );
     assert!(
         !app.world()
             .resource::<ButtonInput<MouseButton>>()
@@ -470,6 +481,10 @@ fn idle_shutdown_refreshes_only_after_accepted_commands() {
         );
         assert_eq!(response["ok"], Value::Bool(false));
         assert_eq!(response["error"]["code"], "position_out_of_bounds");
+        assert_eq!(
+            response["error"]["message"],
+            "point [999,10] outside logical window 640x480"
+        );
 
         update_for(&mut app, Duration::from_millis(1200));
         assert!(

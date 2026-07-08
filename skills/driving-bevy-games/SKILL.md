@@ -62,15 +62,7 @@ agent = ["dep:bevy-agent-feedback-plugin"]
 }
 ```
 
-Pin deterministic captures and assert this from the driver:
-
-```rust
-Window {
-    resolution: bevy::window::WindowResolution::new(1280, 720)
-        .with_scale_factor_override(1.0),
-    ..default()
-}
-```
+Only pin `WindowResolution` when the test owns the game window and needs deterministic visual regression coordinates. General smoke/playtest drivers should leave the game window alone and use `window_info()`-derived helpers.
 
 Done when `cargo check --features agent` passes.
 
@@ -91,6 +83,25 @@ Why this path:
 
 ## Driver skeleton
 
+### Portable smoke/playtest
+
+```python
+from bevy_feedback import BevyFeedbackClient
+
+with BevyFeedbackClient() as game:
+    before = game.capture()
+    center = game.window_center()
+    right = game.point(0.95, 0.5)
+    game.drag("Right", center, right, steps=80, frames=120)
+    game.wait(10)
+    after = game.capture()
+    game.assert_changed(before, after)
+```
+
+Use this when the smoke test does not own the game's window setup.
+
+### Deterministic visual regression
+
 ```python
 from bevy_feedback import BevyFeedbackClient
 
@@ -108,6 +119,8 @@ with BevyFeedbackClient() as game:
     after = game.capture()
     game.assert_changed(before, after)
 ```
+
+Fixed pixels are appropriate only after those assertions pass.
 
 Add domain assertions after the second capture: colors, text, region changes, or protocol diagnostics. Do not trust input success alone.
 
@@ -144,7 +157,7 @@ python3 .agents/skills/driving-bevy-games/drive.py "$BEVY_FEEDBACK_PROTOCOL" < c
 
 Prefer compound actions: `click`, `drag`, `scroll`, `key_tap`, `key_hold`. They auto-release and are easier to reason about than primitive down/up pairs.
 
-Coordinates are logical window pixels, origin top-left. `mouse_position` in responses is the agent logical cursor. `window.cursor_position` appears only when the OS/window reports a cursor. On Wayland, cursor commands synthesize Bevy `CursorMoved` events and do not require OS cursor warping.
+Coordinates are logical window pixels, origin top-left. `mouse_position` in responses is the agent logical cursor. `window.cursor_position` appears only when the OS/window reports a cursor. On Wayland, cursor commands synthesize Bevy `CursorMoved` events and do not require OS cursor warping. For portable smoke tests prefer `game.window_center()` and `game.point(frac_x, frac_y)` over fixed pixels.
 
 ## Diagnostics
 
@@ -176,6 +189,6 @@ The wrapper releases inputs and sends `shutdown` during cleanup. Manual clients 
 - Readiness timeout: increase `--ready-timeout MS` or set `BEVY_FEEDBACK_READY_TIMEOUT_MS` when a clean Bevy build exceeds 60s.
 - Stale protocol: delete old `target/agent-feedback/agent-feedback.json` only after confirming no game is alive; clients reject stale pid/heartbeat data.
 - Driver failures: `drive.py` prints JSON error envelopes and exits `1` for bad lines or command failures; no Python traceback for expected protocol errors.
-- Wrong window size: pin `WindowResolution` and assert `window_info().result.window.logical_*` plus `scale_factor` before input.
+- Hardcoded point out of bounds: for portable smoke tests use `window_center()`/`point(...)`; for deterministic visual regression, pin `WindowResolution` and assert `window_info().result.window.logical_*` plus `scale_factor` before input.
 - No display/CI: run under a real display, Wayland, or `xvfb-run -s '-screen 0 1280x720x24'`.
 - OCR failures: install Pillow for region crops and `tesseract` plus language packs for text assertions.

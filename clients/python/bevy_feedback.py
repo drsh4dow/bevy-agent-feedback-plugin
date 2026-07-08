@@ -127,6 +127,18 @@ class BevyFeedbackClient:
     def window_info(self) -> dict[str, Any]:
         return self.request({"command": "window_info"})
 
+    def window_center(self) -> tuple[float, float]:
+        width, height = self._logical_window_size()
+        return (width / 2.0, height / 2.0)
+
+    def point(self, frac_x: float, frac_y: float) -> tuple[float, float]:
+        if not (0.0 <= frac_x < 1.0 and 0.0 <= frac_y < 1.0):
+            raise BevyFeedbackError(
+                "point fractions must satisfy 0.0 <= frac_x < 1.0 and 0.0 <= frac_y < 1.0"
+            )
+        width, height = self._logical_window_size()
+        return (width * frac_x, height * frac_y)
+
     def cursor_move(self, x: float, y: float) -> dict[str, Any]:
         return self.request({"command": "cursor_move", "x": x, "y": y})
 
@@ -303,6 +315,16 @@ class BevyFeedbackClient:
                 + "\n"
             )
             self._transcript.flush()
+
+    def _logical_window_size(self) -> tuple[float, float]:
+        response = self.window_info()
+        result = response.get("result")
+        window = result.get("window") if isinstance(result, dict) else None
+        width = window.get("logical_width") if isinstance(window, dict) else None
+        height = window.get("logical_height") if isinstance(window, dict) else None
+        if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+            raise BevyFeedbackError(f"window_info response missing logical window dimensions: {response}")
+        return (float(width), float(height))
 
     def _with_last_capture(self, message: str) -> str:
         if self._last_capture:

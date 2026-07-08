@@ -147,10 +147,17 @@ pub(super) fn error_response(id: Value, error: CommandError) -> AgentResponse {
         CommandError::MissingWindow => {
             AgentResponse::error(id, "missing_window", "primary Window resource is missing")
         }
-        CommandError::PositionOutOfBounds => AgentResponse::error(
+        CommandError::PositionOutOfBounds {
+            position,
+            logical_width,
+            logical_height,
+        } => AgentResponse::error(
             id,
             "position_out_of_bounds",
-            "cursor position is outside the primary window",
+            format!(
+                "point [{},{}] outside logical window {}x{}",
+                position.x, position.y, logical_width, logical_height
+            ),
         ),
     }
 }
@@ -300,13 +307,21 @@ fn validate_position(window: &Window, position: Vec2) -> Result<(), CommandError
     if contains_position(window, position) {
         Ok(())
     } else {
-        Err(CommandError::PositionOutOfBounds)
+        Err(CommandError::PositionOutOfBounds {
+            position,
+            logical_width: window.width(),
+            logical_height: window.height(),
+        })
     }
 }
 
 pub(super) enum CommandError {
     MissingWindow,
-    PositionOutOfBounds,
+    PositionOutOfBounds {
+        position: Vec2,
+        logical_width: f32,
+        logical_height: f32,
+    },
 }
 
 pub(super) fn release_all_inputs_internal(

@@ -25,7 +25,13 @@ fn main() -> ExitCode {
 
 fn real_main() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let args = parse_args(&args)?;
+    let args = match parse_args(&args)? {
+        RunCommand::Help => {
+            println!("{}", usage());
+            return Ok(());
+        }
+        RunCommand::Run(args) => args,
+    };
     fs::create_dir_all(&args.artifacts).map_err(|error| error.to_string())?;
     if let Some(parent) = args.protocol_file.parent()
         && !parent.as_os_str().is_empty()
@@ -42,7 +48,14 @@ fn real_main() -> Result<(), String> {
     fs::create_dir_all(&capture_dir).map_err(|error| error.to_string())?;
     let transcript_file = args.artifacts.join("transcript.jsonl");
     File::create(&transcript_file).map_err(|error| error.to_string())?;
-    let mut game = spawn_command(&args.game, &args, &capture_dir, &transcript_file, true)?;
+    let mut game = spawn_command(
+        "--game",
+        &args.game,
+        &args,
+        &capture_dir,
+        &transcript_file,
+        true,
+    )?;
     stream_child_logs(&mut game, log_file);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -76,7 +89,14 @@ fn real_main() -> Result<(), String> {
     let mut failure_summary = String::new();
     let mut driver_failed = false;
     if let Some(driver) = &args.driver {
-        let mut driver = spawn_command(driver, &args, &capture_dir, &transcript_file, false)?;
+        let mut driver = spawn_command(
+            "--driver",
+            driver,
+            &args,
+            &capture_dir,
+            &transcript_file,
+            false,
+        )?;
         match wait_child(&mut driver, args.driver_timeout).map_err(|error| error.to_string())? {
             Some(status) => {
                 driver_failed = !status.success();
@@ -132,14 +152,25 @@ struct RunArgs {
     driver: Option<Vec<String>>,
 }
 
-fn parse_args(args: &[String]) -> Result<RunArgs, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum RunCommand {
+    Help,
+    Run(RunArgs),
+}
+
+fn parse_args(args: &[String]) -> Result<RunCommand, String> {
     parse_args_with_env(args, |name| std::env::var_os(name))
 }
 
 fn parse_args_with_env(
     args: &[String],
     get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Result<RunArgs, String> {
+) -> Result<RunCommand, String> {
+    if matches!(args, [arg] if arg == "--help" || arg == "-h")
+        || matches!(args, [command, arg] if command == "run" && (arg == "--help" || arg == "-h"))
+    {
+        return Ok(RunCommand::Help);
+    }
     if args.first().map(String::as_str) != Some("run") {
         return Err(usage());
     }
@@ -215,7 +246,7 @@ fn parse_args_with_env(
                 if game.is_empty() {
                     return Err(usage());
                 }
-                return Ok(RunArgs {
+                return Ok(RunCommand::Run(RunArgs {
                     protocol_file,
                     artifacts,
                     ready_timeout,
@@ -223,7 +254,7 @@ fn parse_args_with_env(
                     driver_timeout,
                     game,
                     driver: None,
-                });
+                }));
             }
             _ => return Err(usage()),
         }
@@ -262,7 +293,7 @@ fn parse_game_driver(
     ready_timeout: Duration,
     shutdown_timeout: Duration,
     driver_timeout: Duration,
-) -> Result<RunArgs, String> {
+) -> Result<RunCommand, String> {
     let driver_index = args.iter().position(|arg| arg == "--driver");
     let (game, driver) = match driver_index {
         Some(index) => (&args[..index], Some(args[index + 1..].to_vec())),
@@ -271,7 +302,7 @@ fn parse_game_driver(
     if game.is_empty() || driver.as_ref().is_some_and(Vec::is_empty) {
         return Err(usage());
     }
-    Ok(RunArgs {
+    Ok(RunCommand::Run(RunArgs {
         protocol_file,
         artifacts,
         ready_timeout,
@@ -279,7 +310,7 @@ fn parse_game_driver(
         driver_timeout,
         game: game.to_vec(),
         driver,
-    })
+    }))
 }
 
 fn usage() -> String {
@@ -297,11 +328,19 @@ env:
   BEVY_FEEDBACK_TRANSCRIPT          exported to game/driver as transcript.jsonl
 
 timeouts:
-  readiness 60s, driver 300s, shutdown 5s"
+  readiness 60s, driver 300s, shutdown 5s
+
+examples:
+  bevy-feedback run -- cargo run --example minimal
+  bevy-feedback run --ready-timeout 180000 --game cargo run --features agent --driver python3 tests/drive_camera.py
+
+note:
+  Do not quote the whole game or driver command; pass each argv word separately."
         .to_string()
 }
 
 fn spawn_command(
+    label: &str,
     command: &[String],
     args: &RunArgs,
     capture_dir: &Path,
@@ -320,7 +359,20 @@ fn spawn_command(
     }
     child
         .spawn()
-        .map_err(|error| format!("spawn {:?}: {error}", command))
+        .map_err(|error| spawn_error(label, command, error))
+}
+
+fn spawn_error(label: &str, command: &[String], error: io::Error) -> String {
+    let mut message = format!("spawn {label} {command:?}: {error}");
+    if command
+        .first()
+        .is_some_and(|executable| executable.chars().any(char::is_whitespace))
+    {
+        message.push_str(
+            "; executable contains whitespace; if this was a command plus arguments, pass each argv word separately",
+        );
+    }
+    message
 }
 
 fn stream_child_logs(child: &mut Child, log_file: Arc<Mutex<File>>) {
@@ -519,18 +571,26 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn run_args(command: RunCommand) -> RunArgs {
+        match command {
+            RunCommand::Run(args) => args,
+            RunCommand::Help => panic!("expected run args"),
+        }
+    }
 
     #[test]
     fn parses_game_only_command() {
-        let args = parse_args(&[
-            "run".into(),
-            "--".into(),
-            "cargo".into(),
-            "run".into(),
-            "--example".into(),
-            "minimal".into(),
-        ])
-        .expect("args");
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--".into(),
+                "cargo".into(),
+                "run".into(),
+                "--example".into(),
+                "minimal".into(),
+            ])
+            .expect("args"),
+        );
 
         assert_eq!(args.game, ["cargo", "run", "--example", "minimal"]);
         assert_eq!(args.driver, None);
@@ -538,18 +598,20 @@ mod tests {
 
     #[test]
     fn parses_game_and_driver_command() {
-        let args = parse_args(&[
-            "run".into(),
-            "--protocol".into(),
-            "target/agent.json".into(),
-            "--game".into(),
-            "cargo".into(),
-            "run".into(),
-            "--driver".into(),
-            "python3".into(),
-            "drive.py".into(),
-        ])
-        .expect("args");
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--protocol".into(),
+                "target/agent.json".into(),
+                "--game".into(),
+                "cargo".into(),
+                "run".into(),
+                "--driver".into(),
+                "python3".into(),
+                "drive.py".into(),
+            ])
+            .expect("args"),
+        );
 
         assert_eq!(args.protocol_file, PathBuf::from("target/agent.json"));
         assert_eq!(args.game, ["cargo", "run"]);
@@ -558,19 +620,21 @@ mod tests {
 
     #[test]
     fn parses_timeout_flags_for_game_only_command() {
-        let args = parse_args(&[
-            "run".into(),
-            "--ready-timeout".into(),
-            "120000".into(),
-            "--driver-timeout".into(),
-            "400000".into(),
-            "--shutdown-timeout".into(),
-            "9000".into(),
-            "--".into(),
-            "cargo".into(),
-            "run".into(),
-        ])
-        .expect("args");
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--ready-timeout".into(),
+                "120000".into(),
+                "--driver-timeout".into(),
+                "400000".into(),
+                "--shutdown-timeout".into(),
+                "9000".into(),
+                "--".into(),
+                "cargo".into(),
+                "run".into(),
+            ])
+            .expect("args"),
+        );
 
         assert_eq!(args.ready_timeout, Duration::from_millis(120_000));
         assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
@@ -579,22 +643,24 @@ mod tests {
 
     #[test]
     fn parses_timeout_flags_for_game_and_driver_command() {
-        let args = parse_args(&[
-            "run".into(),
-            "--ready-timeout".into(),
-            "120000".into(),
-            "--driver-timeout".into(),
-            "400000".into(),
-            "--shutdown-timeout".into(),
-            "9000".into(),
-            "--game".into(),
-            "cargo".into(),
-            "run".into(),
-            "--driver".into(),
-            "python3".into(),
-            "drive.py".into(),
-        ])
-        .expect("args");
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--ready-timeout".into(),
+                "120000".into(),
+                "--driver-timeout".into(),
+                "400000".into(),
+                "--shutdown-timeout".into(),
+                "9000".into(),
+                "--game".into(),
+                "cargo".into(),
+                "run".into(),
+                "--driver".into(),
+                "python3".into(),
+                "drive.py".into(),
+            ])
+            .expect("args"),
+        );
 
         assert_eq!(args.ready_timeout, Duration::from_millis(120_000));
         assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
@@ -620,19 +686,115 @@ mod tests {
 
     #[test]
     fn uses_timeout_env_defaults() {
-        let args = parse_args_with_env(
-            &["run".into(), "--".into(), "cargo".into(), "run".into()],
-            |name| match name {
-                "BEVY_FEEDBACK_READY_TIMEOUT_MS" => Some(std::ffi::OsString::from("120000")),
-                "BEVY_FEEDBACK_DRIVER_TIMEOUT_MS" => Some(std::ffi::OsString::from("400000")),
-                "BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS" => Some(std::ffi::OsString::from("9000")),
-                _ => None,
-            },
-        )
-        .expect("args");
+        let args = run_args(
+            parse_args_with_env(
+                &["run".into(), "--".into(), "cargo".into(), "run".into()],
+                |name| match name {
+                    "BEVY_FEEDBACK_READY_TIMEOUT_MS" => Some(std::ffi::OsString::from("120000")),
+                    "BEVY_FEEDBACK_DRIVER_TIMEOUT_MS" => Some(std::ffi::OsString::from("400000")),
+                    "BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS" => Some(std::ffi::OsString::from("9000")),
+                    _ => None,
+                },
+            )
+            .expect("args"),
+        );
 
         assert_eq!(args.ready_timeout, Duration::from_millis(120_000));
         assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
         assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
+    }
+
+    #[test]
+    fn parses_run_help() {
+        assert_eq!(
+            parse_args(&["run".into(), "--help".into()]).expect("help"),
+            RunCommand::Help
+        );
+        assert_eq!(
+            parse_args(&["run".into(), "-h".into()]).expect("help"),
+            RunCommand::Help
+        );
+    }
+
+    #[test]
+    fn parses_global_help() {
+        assert_eq!(
+            parse_args(&["--help".into()]).expect("help"),
+            RunCommand::Help
+        );
+        assert_eq!(parse_args(&["-h".into()]).expect("help"), RunCommand::Help);
+    }
+
+    #[test]
+    fn help_does_not_read_timeout_env() {
+        assert_eq!(
+            parse_args_with_env(&["run".into(), "--help".into()], |name| {
+                panic!("help should not read env {name}")
+            })
+            .expect("help"),
+            RunCommand::Help
+        );
+    }
+
+    #[test]
+    fn does_not_consume_help_after_separator() {
+        let args =
+            run_args(parse_args(&["run".into(), "--".into(), "--help".into()]).expect("args"));
+
+        assert_eq!(args.game, ["--help"]);
+    }
+
+    #[test]
+    fn parses_separator_game_path_with_spaces() {
+        let args = run_args(
+            parse_args(&["run".into(), "--".into(), "/tmp/My Game/game".into()]).expect("args"),
+        );
+
+        assert_eq!(args.game, ["/tmp/My Game/game"]);
+        assert_eq!(args.driver, None);
+    }
+
+    #[test]
+    fn parses_game_and_driver_paths_with_spaces() {
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--game".into(),
+                "/tmp/My Game/game".into(),
+                "--driver".into(),
+                "/tmp/My Driver/driver.py".into(),
+            ])
+            .expect("args"),
+        );
+
+        assert_eq!(args.game, ["/tmp/My Game/game"]);
+        assert_eq!(args.driver, Some(vec!["/tmp/My Driver/driver.py".into()]));
+    }
+
+    #[test]
+    fn spawn_error_hints_when_executable_contains_whitespace() {
+        let error = spawn_error(
+            "--game",
+            &["cargo run --features agent".into()],
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        );
+
+        assert!(
+            error.contains("spawn --game [\"cargo run --features agent\"]: missing"),
+            "{error}"
+        );
+        assert!(error.contains("pass each argv word separately"), "{error}");
+    }
+
+    #[test]
+    fn usage_shows_cargo_driver_argv_example() {
+        let usage = usage();
+
+        assert!(
+            usage.contains(
+                "--game cargo run --features agent --driver python3 tests/drive_camera.py"
+            )
+        );
+        assert!(usage.contains("Do not quote the whole game or driver command"));
     }
 }
