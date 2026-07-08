@@ -1,19 +1,17 @@
+mod controls_support;
+
 use bevy::{
-    app::AppExit,
-    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseWheel},
+    asset::RenderAssetUsages,
     prelude::*,
-    window::{FileDragAndDrop, Ime, PrimaryWindow},
+    render::{
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
+        view::window::screenshot::ScreenshotCaptured,
+    },
+    window::PrimaryWindow,
 };
-use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin};
+use controls_support::*;
 use serde_json::Value;
-use std::{
-    fs,
-    io::{self, Read, Write},
-    net::{SocketAddr, TcpStream},
-    path::PathBuf,
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, thread, time::Duration};
 
 #[test]
 fn socket_key_and_mouse_buttons_update_bevy_input() {
@@ -320,7 +318,7 @@ fn invalid_request_preserves_id_for_validation_errors() {
 
     assert_eq!(response["ok"], Value::Bool(false));
     assert_eq!(response["id"], "bad-button");
-    assert_eq!(response["error"]["code"], "invalid_request");
+    assert_eq!(response["error"]["code"], "invalid_argument");
     assert!(
         response["error"]["message"]
             .as_str()
@@ -344,6 +342,52 @@ fn malformed_json_returns_null_id() {
     assert_eq!(response["ok"], Value::Bool(false));
     assert_eq!(response["id"], Value::Null);
     assert_eq!(response["error"]["code"], "invalid_request");
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn labeled_capture_uses_label_in_filename_and_response() {
+    let (mut app, config) = agent_app("labeled-capture");
+    let mut stream = connect(&config);
+
+    send_raw(
+        &mut stream,
+        r#"{"id":"capture-hud","command":"capture","label":"hud_1"}"#,
+    );
+    let screenshot = screenshot_entity(&mut app);
+    app.world_mut().trigger(ScreenshotCaptured {
+        entity: screenshot,
+        image: bevy::image::Image::new_fill(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 255],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        ),
+    });
+
+    let response = read_response_while_updating(&mut app, &mut stream);
+    let expected_path = config.capture_dir.join("capture-000000-hud_1.png");
+
+    assert_eq!(response["ok"], Value::Bool(true));
+    assert_eq!(response["id"], "capture-hud");
+    assert_eq!(response["result"]["status"], "captured");
+    assert_eq!(response["result"]["capture"]["sequence"], Value::from(0));
+    assert_eq!(response["result"]["capture"]["label"], "hud_1");
+    assert_eq!(response["result"]["latest_capture"]["label"], "hud_1");
+    assert_eq!(
+        PathBuf::from(
+            response["result"]["capture"]["path"]
+                .as_str()
+                .expect("capture response should include a path")
+        ),
+        expected_path
+    );
+    assert!(expected_path.exists());
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
 
@@ -512,170 +556,4 @@ fn idle_shutdown_refreshes_only_after_accepted_commands() {
         );
         let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
     }
-}
-
-#[derive(Resource, Default)]
-struct ObservedControls {
-    text: String,
-    motion_delta: Vec2,
-    scroll_delta: Vec2,
-    scroll_y: f32,
-    dropped_file: Option<PathBuf>,
-}
-
-#[derive(Resource, Default)]
-struct ObservedExits {
-    count: usize,
-}
-
-fn observe_controls(
-    mut observed: ResMut<ObservedControls>,
-    mut ime: MessageReader<Ime>,
-    mut mouse_wheel: MessageReader<MouseWheel>,
-    mut file_drag_drop: MessageReader<FileDragAndDrop>,
-    motion: Res<AccumulatedMouseMotion>,
-    scroll: Res<AccumulatedMouseScroll>,
-) {
-    if motion.delta != Vec2::ZERO {
-        observed.motion_delta = motion.delta;
-    }
-    if scroll.delta != Vec2::ZERO {
-        observed.scroll_delta = scroll.delta;
-    }
-    for event in ime.read() {
-        if let Ime::Commit { value, .. } = event {
-            observed.text.push_str(value);
-        }
-    }
-    for event in mouse_wheel.read() {
-        observed.scroll_y += event.y;
-    }
-    for event in file_drag_drop.read() {
-        if let FileDragAndDrop::DroppedFile { path_buf, .. } = event {
-            observed.dropped_file = Some(path_buf.clone());
-        }
-    }
-}
-
-fn agent_app(name: &str) -> (App, AgentFeedbackConfig) {
-    agent_app_with_config(name, None)
-}
-
-fn agent_app_with_idle_shutdown(name: &str, idle_after: Duration) -> (App, AgentFeedbackConfig) {
-    agent_app_with_config(name, Some(idle_after))
-}
-
-fn agent_app_with_config(
-    name: &str,
-    idle_shutdown_after: Option<Duration>,
-) -> (App, AgentFeedbackConfig) {
-    let root = temp_root(name);
-    let config = AgentFeedbackConfig {
-        bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        protocol_file: root.join("agent.json"),
-        capture_dir: root.join("captures"),
-        command_timeout: Duration::from_secs(2),
-        idle_shutdown_after,
-        ..Default::default()
-    };
-    let mut app = App::new();
-    app.add_plugins(bevy::input::InputPlugin);
-    app.world_mut().spawn((
-        Window {
-            resolution: bevy::window::WindowResolution::new(640, 480)
-                .with_scale_factor_override(1.0),
-            ..default()
-        },
-        PrimaryWindow,
-    ));
-    app.add_plugins(AgentFeedbackPlugin::new(config.clone()));
-    (app, config)
-}
-
-fn temp_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "bevy-agent-feedback-{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos()
-    ))
-}
-
-fn heartbeat_path(config: &AgentFeedbackConfig) -> PathBuf {
-    let protocol: Value = serde_json::from_slice(
-        &fs::read(&config.protocol_file).expect("protocol file should be written"),
-    )
-    .expect("protocol file should be JSON");
-    PathBuf::from(
-        protocol["heartbeat_file"]
-            .as_str()
-            .expect("protocol should expose heartbeat file"),
-    )
-}
-
-fn connect(config: &AgentFeedbackConfig) -> TcpStream {
-    let protocol: Value = serde_json::from_slice(
-        &fs::read(&config.protocol_file).expect("protocol file should be written"),
-    )
-    .expect("protocol file should be JSON");
-    let stream = TcpStream::connect(
-        protocol["socket_addr"]
-            .as_str()
-            .expect("protocol should expose socket address"),
-    )
-    .expect("agent socket should accept local connections");
-    stream.set_nonblocking(true).expect("nonblocking stream");
-    stream
-}
-
-fn update_for(app: &mut App, duration: Duration) {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        app.update();
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn observe_app_exit(mut observed: ResMut<ObservedExits>, mut app_exit: MessageReader<AppExit>) {
-    observed.count += app_exit.read().count();
-}
-
-fn send_raw(stream: &mut TcpStream, request: &str) {
-    writeln!(stream, "{request}").expect("send agent command");
-}
-
-fn send(app: &mut App, stream: &mut TcpStream, request: &str) -> Value {
-    send_raw(stream, request);
-    read_response_while_updating(app, stream)
-}
-
-fn send_ok(app: &mut App, stream: &mut TcpStream, request: &str) -> Value {
-    let response = send(app, stream, request);
-    assert_eq!(response["ok"], Value::Bool(true));
-    response
-}
-
-fn read_response_while_updating(app: &mut App, stream: &mut TcpStream) -> Value {
-    let mut bytes = Vec::new();
-    let mut buf = [0_u8; 512];
-    for _ in 0..100 {
-        app.update();
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(read) => {
-                bytes.extend_from_slice(&buf[..read]);
-                if bytes.contains(&b'\n') {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => panic!("read failed: {error}"),
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    assert!(!bytes.is_empty(), "no response from agent socket");
-    serde_json::from_slice(bytes.split(|byte| *byte == b'\n').next().unwrap())
-        .expect("response should be JSON")
 }

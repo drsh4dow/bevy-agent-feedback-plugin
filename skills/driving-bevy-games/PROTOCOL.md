@@ -41,7 +41,7 @@ Error: `{"id":.., "ok":false, "error":{"code":.., "message":..}}` — malformed 
 `result` may carry:
 
 - `status` — short string (`ok`, `captured`, `waited`, `released`, …).
-- `capture` / `latest_capture` — `{"sequence":u64, "path":"…png"}`.
+- `capture` / `latest_capture` — `{"sequence":u64, "path":"…png", "label?":"…"}`.
 - snapshot fields (flattened): `frame`, `game_time_secs`, `window`,
   `mouse_position` `[x,y]`, `pressed_keys[]`, `pressed_buttons[]`.
 - `details` — diagnostics payload.
@@ -52,8 +52,9 @@ Error: `{"id":.., "ok":false, "error":{"code":.., "message":..}}` — malformed 
 
 ### Error codes
 
-`invalid_request` (bad JSON / unknown or malformed command; includes key/button
-suggestions), `line_too_long`, `queue_full`, `closed`, `timeout`,
+`invalid_request` (bad JSON / unknown or malformed command),
+`invalid_argument` (bad command parameter; capture labels must match
+`[A-Za-z0-9_-]{1,40}`), `line_too_long`, `queue_full`, `closed`, `timeout`,
 `missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`,
 `diagnostics_unavailable`, `socket_error`.
 
@@ -96,7 +97,7 @@ frames. Held input (`key_down`, `mouse_down`) persists until released or
 |---|---|---|
 | `window_info` | — | window + snapshot |
 | `wait` | `frames?`=1 | advance `frames` (1..=`max_wait_frames`) |
-| `capture` | — | write PNG; `capture.path` |
+| `capture` | `label?` `[A-Za-z0-9_-]{1,40}` | write PNG; `capture.path`; filename includes `-label` when present |
 | `shutdown` | — | exit the app cleanly |
 
 ### Diagnostics

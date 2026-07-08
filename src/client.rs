@@ -69,6 +69,8 @@ pub struct Capture {
     pub sequence: u64,
     /// PNG path on disk.
     pub path: PathBuf,
+    /// Optional capture label echoed by the plugin.
+    pub label: Option<String>,
 }
 
 /// Pixel-space rectangle used by image assertions.
@@ -271,7 +273,19 @@ impl AgentClient {
 
     /// Captures the primary window as a PNG.
     pub fn capture(&mut self) -> Result<Capture, ClientError> {
-        let response = self.request(json!({"command": "capture"}))?;
+        self.capture_with_label(None)
+    }
+
+    /// Captures the primary window as a labeled PNG.
+    pub fn capture_labeled(&mut self, label: &str) -> Result<Capture, ClientError> {
+        self.capture_with_label(Some(label))
+    }
+
+    fn capture_with_label(&mut self, label: Option<&str>) -> Result<Capture, ClientError> {
+        let response = match label {
+            Some(label) => self.request(json!({"command": "capture", "label": label}))?,
+            None => self.request(json!({"command": "capture"}))?,
+        };
         let capture = capture_from_response(&response)?;
         self.last_capture = Some(capture.path.clone());
         Ok(capture)
@@ -629,9 +643,11 @@ fn capture_from_response(response: &Value) -> Result<Capture, ClientError> {
     let path = capture["path"].as_str().ok_or_else(|| {
         ClientError::Protocol(format!("capture response missing path: {response}"))
     })?;
+    let label = capture["label"].as_str().map(str::to_string);
     Ok(Capture {
         sequence,
         path: PathBuf::from(path),
+        label,
     })
 }
 

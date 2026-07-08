@@ -3,33 +3,59 @@ name: driving-bevy-games
 description: Drive a running Bevy game through the bevy-agent-feedback-plugin socket — send input, capture screenshots, verify behavior from pixels. Use when the user wants to playtest or visually verify a Bevy app, or wants bevy-agent-feedback-plugin wired into a game.
 ---
 
-## Mental model
+## First run
 
-Use a strict **look → act → look** loop. Pixels are truth: capture before acting, send bounded input, wait for frames, capture again, then assert the frame changed or the expected color/text appeared.
-
-Bundled files:
-
-- `bevy_feedback.py` — Python client plus pixel/OCR assertions.
-- `drive.py` — stdin JSON-lines to stdout JSON-lines driver.
-- `PROTOCOL.md` — offline command catalog and response/error shapes. The live protocol file is still authoritative.
-
-## Install/prereqs
+1. Install and verify:
 
 ```sh
 cargo install bevy-agent-feedback-plugin
+bevy-feedback --version
+PYTHONPATH=<path-to-this-skill-dir> bevy-feedback doctor
 ```
 
-- Python 3.10+ for `bevy_feedback.py` and `drive.py`.
-- Optional pixel helpers: `pip install pillow`.
-- Optional OCR helpers: install `tesseract` and language data.
+2. Run game + driver:
+
+```sh
+PYTHONPATH=<path-to-this-skill-dir> \
+bevy-feedback run --ready-timeout 180000 \
+  --game cargo run --features agent \
+  --driver python3 tests/drive_smoke.py
+```
+
+`skill://driving-bevy-games` is a skill reference, NOT a Python import path. `PYTHONPATH` must be the real directory containing `bevy_feedback.py`, usually `.agents/skills/driving-bevy-games`.
+
+`protocol ready != game ready`: the socket exists; assets, menus, save data, and cameras may still be loading. Wait for a stable frame before acting.
+
+3. Copy-paste smoke driver:
+
+```python
+import json
+from pathlib import Path
+import bevy_feedback
+from bevy_feedback import BevyFeedbackClient, fail
+
+def main(game: BevyFeedbackClient) -> None:
+    loading = game.capture(label="loading")
+    first = game.wait_until_changed(loading, frames=30, attempts=60, label="default")
+    before = game.capture(label="before_drag")
+    game.drag("Left", game.window_center(), game.point(0.90, 0.50), steps=30, frames=45)
+    game.wait(10)
+    after = game.capture(label="after_drag")
+    game.assert_changed(before, after, min_pixels=1)
+    if not Path(after).exists():
+        fail(f"missing final capture: {after}")
+    print(json.dumps({"loading": str(loading), "default": str(first), "before_drag": str(before), "after_drag": str(after)}))
+
+bevy_feedback.run(main)
+```
+
+4. Results: live PNGs are in the protocol file's `capture_dir`; after `bevy-feedback run`, use the printed `<artifacts>/screenshots/`. On failure, read `failure-summary.txt`, `game.log`, `driver.log`, `transcript.jsonl`.
 
 ## Wire the game
 
-Add the plugin as a dev-only optional dependency. Enable `diagnostics` only if you need ECS/state/marker introspection.
-
 ```toml
 [dependencies]
-bevy-agent-feedback-plugin = { version = "0.2", optional = true, features = ["diagnostics"] }
+bevy-agent-feedback-plugin = { version = "0.3", optional = true, features = ["diagnostics"] }
 
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
@@ -41,7 +67,6 @@ agent = ["dep:bevy-agent-feedback-plugin"]
     use bevy_agent_feedback_plugin::{
         AgentFeedbackConfig, AgentFeedbackDiagnosticsPlugin, AgentFeedbackPlugin,
     };
-
     app.add_plugins(AgentFeedbackPlugin::new(AgentFeedbackConfig {
         bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
@@ -52,8 +77,6 @@ agent = ["dep:bevy-agent-feedback-plugin"]
             .unwrap_or_else(|| "target/agent-feedback/captures".into()),
         ..Default::default()
     }));
-
-    // Optional diagnostics; register only types you need to inspect.
     app.add_plugins(
         AgentFeedbackDiagnosticsPlugin::default()
             // .with_state::<AppState>()
@@ -62,133 +85,61 @@ agent = ["dep:bevy-agent-feedback-plugin"]
 }
 ```
 
-Only pin `WindowResolution` when the test owns the game window and needs deterministic visual regression coordinates. General smoke/playtest drivers should leave the game window alone and use `window_info()`-derived helpers.
+Use diagnostics only for ECS/state/marker queries. Done when `cargo check --features agent` passes.
 
-Done when `cargo check --features agent` passes.
+## Readiness
 
-## Best path: wrapper + driver
-
-```sh
-PYTHONPATH=.agents/skills/driving-bevy-games \
-bevy-feedback run --ready-timeout 180000 \
-  --game cargo run --features agent \
-  --driver python3 tests/drive_camera.py
-```
-
-Why this path:
-
-- `bevy-feedback run` exports `BEVY_FEEDBACK_PROTOCOL`, `BEVY_FEEDBACK_CAPTURE_DIR`, `BEVY_FEEDBACK_ARTIFACTS`, and `BEVY_FEEDBACK_TRANSCRIPT`.
-- `--ready-timeout 180000` prevents clean Bevy builds from failing at the default 60s readiness wait.
-- `--game ... --driver ...` runs the game and driver under one lifecycle: wait for protocol readiness, run the driver, release inputs, send `shutdown`, copy artifacts.
-
-## Driver skeleton
-
-### Portable smoke/playtest
+No diagnostics: pixels are truth. Capture loading, wait for change, then optionally wait for a known color:
 
 ```python
-from bevy_feedback import BevyFeedbackClient
-
-with BevyFeedbackClient() as game:
-    before = game.capture()
-    center = game.window_center()
-    right = game.point(0.95, 0.5)
-    game.drag("Right", center, right, steps=80, frames=120)
-    game.wait(10)
-    after = game.capture()
-    game.assert_changed(before, after)
+loading = game.capture(label="loading")
+ready = game.wait_until_changed(loading, frames=30, attempts=60, label="ready")
+game.wait_until_color((255, 255, 255), (20, 20, 120, 40), tolerance=10, attempts=30, label="hud")
 ```
 
-Use this when the smoke test does not own the game's window setup.
+Diagnostics: recommended when waiting on Bevy states. Add `AgentFeedbackDiagnosticsPlugin::default().with_state::<AppState>()`, then poll `state_info`. Plain `AgentFeedbackPlugin` has no state query.
 
-### Deterministic visual regression
+## Assertions & inputs
+
+Use look → act → look. Trust a command only after a pixel/color/text/diagnostic check.
+
+- Prefer `click`, `drag`, `scroll`, `key_tap`, `key_hold`; they auto-release.
+- Coordinates are logical pixels, origin top-left. Use `window_center()` and `point(frac_x, frac_y)` for portable smoke tests.
+- Labeled captures use `[A-Za-z0-9_-]{1,40}` and produce `capture-000123-label.png`.
+- Use `fail("message")`; `bevy_feedback.run(main)` prints one-line JSON and hides expected game/client tracebacks.
+
+Exact window dimensions are only safe when the test owns the display environment (Xvfb/headless CI); local window managers override `WindowResolution`.
 
 ```python
-from bevy_feedback import BevyFeedbackClient
-
-EXPECTED_SIZE = (1280.0, 720.0)
-EXPECTED_SCALE = 1.0
-
-with BevyFeedbackClient() as game:
-    info = game.window_info()["result"]["window"]
-    assert (info["logical_width"], info["logical_height"]) == EXPECTED_SIZE, info
-    assert info["scale_factor"] == EXPECTED_SCALE, info
-
-    before = game.capture()
-    game.key_hold("KeyW", frames=10)
-    game.wait(10)
-    after = game.capture()
-    game.assert_changed(before, after)
+info = game.window_info()["result"]["window"]
+if (info["logical_width"], info["logical_height"], info["scale_factor"]) != (1280.0, 720.0, 1.0):
+    fail(f"unexpected window metrics: {info}")
 ```
 
-Fixed pixels are appropriate only after those assertions pass.
-
-Add domain assertions after the second capture: colors, text, region changes, or protocol diagnostics. Do not trust input success alone.
-
-## Manual mode
-
-Run the game through the wrapper without a driver:
+## Manual mode / artifacts / cleanup / troubleshooting
 
 ```sh
 bevy-feedback run -- cargo run --features agent
-```
-
-In another shell, send raw JSON-lines:
-
-```sh
 python3 .agents/skills/driving-bevy-games/drive.py "$BEVY_FEEDBACK_PROTOCOL" < commands.jsonl
 ```
 
-`drive.py` also defaults to `$BEVY_FEEDBACK_PROTOCOL` and then `target/agent-feedback/agent-feedback.json`.
+| path | purpose |
+|---|---|
+| `game.log` / `driver.log` | stdout/stderr streams |
+| `protocol.json` | copied live protocol/session metadata |
+| `transcript.jsonl` | replayable request/response/timing envelopes |
+| `captures/` | wrapper-exported fallback live capture dir |
+| `screenshots/` | final copied PNGs from protocol `capture_dir` |
+| `failure-summary.txt` | failure reason, log tails, newest capture |
 
-## Artifacts
+The wrapper releases inputs and sends `shutdown`. Manual clients should send `release_all_inputs` and `shutdown`, or call `BevyFeedbackClient.close()`.
 
-| path | produced by | purpose |
-|---|---|---|
-| `game.log` | wrapper | game stdout/stderr stream |
-| `protocol.json` | wrapper cleanup/failure | copied live protocol/session metadata |
-| `transcript.jsonl` | clients via `BEVY_FEEDBACK_TRANSCRIPT` | replayable request/response/timing envelopes |
-| `captures/` | live plugin | capture command PNGs during the run |
-| `screenshots/` | wrapper cleanup/failure | final copy of PNG captures for upload |
-| `failure-summary.txt` | wrapper failure path | failure reason, log tail, newest capture |
-
-`run --driver` is the mode that reliably produces transcript entries for driver commands, because the wrapper exports `BEVY_FEEDBACK_TRANSCRIPT` before starting the driver.
-
-## Inputs
-
-Prefer compound actions: `click`, `drag`, `scroll`, `key_tap`, `key_hold`. They auto-release and are easier to reason about than primitive down/up pairs.
-
-Coordinates are logical window pixels, origin top-left. `mouse_position` in responses is the agent logical cursor. `window.cursor_position` appears only when the OS/window reports a cursor. On Wayland, cursor commands synthesize Bevy `CursorMoved` events and do not require OS cursor warping. For portable smoke tests prefer `game.window_center()` and `game.point(frac_x, frac_y)` over fixed pixels.
-
-## Diagnostics
-
-Diagnostics are debug-only: enable the crate `diagnostics` feature and add `AgentFeedbackDiagnosticsPlugin`.
-
-Use diagnostics after capture/input checks, not instead of them:
-
-- `ecs_summary`
-- `list_entities`
-- `camera_info`
-- `state_info`
-- `marker_info`
-
-Large diagnostics are capped. When capped, counts are lower bounds and include `*_is_lower_bound: true`; entity/camera arrays are truncated.
-
-## Cleanup
-
-The wrapper releases inputs and sends `shutdown` during cleanup. Manual clients should call:
-
-```jsonl
-{"command":"release_all_inputs"}
-{"command":"shutdown"}
-```
-
-`BevyFeedbackClient.close()` releases held inputs before closing the socket. Stale protocol files are rejected by pid and heartbeat checks.
-
-## Troubleshooting
-
-- Readiness timeout: increase `--ready-timeout MS` or set `BEVY_FEEDBACK_READY_TIMEOUT_MS` when a clean Bevy build exceeds 60s.
-- Stale protocol: delete old `target/agent-feedback/agent-feedback.json` only after confirming no game is alive; clients reject stale pid/heartbeat data.
-- Driver failures: `drive.py` prints JSON error envelopes and exits `1` for bad lines or command failures; no Python traceback for expected protocol errors.
-- Hardcoded point out of bounds: for portable smoke tests use `window_center()`/`point(...)`; for deterministic visual regression, pin `WindowResolution` and assert `window_info().result.window.logical_*` plus `scale_factor` before input.
-- No display/CI: run under a real display, Wayland, or `xvfb-run -s '-screen 0 1280x720x24'`.
-- OCR failures: install Pillow for region crops and `tesseract` plus language packs for text assertions.
+| symptom | fix |
+|---|---|
+| `protocol file not found` | start the game through `bevy-feedback run` |
+| readiness timeout | increase `--ready-timeout MS`; clean Bevy builds can exceed 60s |
+| stale protocol | stop old games; clients reject stale pid/heartbeat data |
+| `import bevy_feedback` fails | set `PYTHONPATH` to the real skill directory |
+| no screenshots in artifacts | inspect `protocol.json.capture_dir`; wrapper copies that directory |
+| OCR errors | install Pillow for crops; install `tesseract` plus language data |
+| no display/CI | use a real display, Wayland, or `xvfb-run -s '-screen 0 1280x720x24'` |

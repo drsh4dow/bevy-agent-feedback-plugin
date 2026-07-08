@@ -112,8 +112,10 @@ export class BevyFeedbackClient {
     return this.request({ command: "wait", frames });
   }
 
-  async capture(): Promise<string> {
-    const response = await this.request({ command: "capture" });
+  async capture(label?: string): Promise<string> {
+    const response = await this.request(
+      label === undefined ? { command: "capture" } : { command: "capture", label },
+    );
     const capture = response.result as JsonObject | undefined;
     const info = capture?.capture as JsonObject | undefined;
     const path = info?.path;

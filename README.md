@@ -2,12 +2,18 @@
 
 Local agent feedback for Bevy apps.
 
-This crate lets Pi/Codex drive a running Bevy app through a v2 JSON-lines TCP protocol. Agents can press keys, move/click/drag/scroll the mouse, submit text/file-drop events, query window metadata, wait for frames, capture PNG screenshots, replay transcripts, and shut the app down cleanly.
+This crate lets Pi/Codex drive a running Bevy app through a v2 JSON-lines TCP protocol. Agents can press keys, move/click/drag/scroll the mouse, submit text/file-drop events, query window metadata, wait for frames, capture labeled PNG screenshots, replay transcripts, and shut the app down cleanly.
 
 ## Install
 
 ```sh
 cargo add bevy-agent-feedback-plugin --optional
+```
+
+Manual `Cargo.toml` form uses the `0.3` line:
+
+```toml
+bevy-agent-feedback-plugin = { version = "0.3", optional = true }
 ```
 
 ```toml
@@ -35,6 +41,8 @@ Install the wrapper binary (`bevy-feedback`):
 
 ```sh
 cargo install bevy-agent-feedback-plugin
+bevy-feedback --version
+bevy-feedback doctor
 ```
 
 Dev form from this repo:
@@ -91,7 +99,7 @@ cargo run --bin bevy-feedback -- run --ready-timeout 180000 \
   --driver python3 my_driver.py
 ```
 
-The wrapper exports the protocol/capture/artifact paths, waits for readiness, streams logs, releases inputs, sends `shutdown`, and writes artifacts. Timeout flags use milliseconds and can also come from environment variables:
+The wrapper exports the protocol/capture/artifact paths, waits for protocol readiness, streams logs, releases inputs, sends `shutdown`, copies PNGs from the protocol file's `capture_dir` into `artifacts/screenshots/`, and prints those screenshot paths on success. Protocol ready means the automation socket exists; wait for a stable game frame in the driver before capturing. Timeout flags use milliseconds and can also come from environment variables:
 
 | flag | env | default |
 |---|---|---|
@@ -104,10 +112,11 @@ Artifacts from `bevy-feedback run`:
 | path | purpose |
 |---|---|
 | `game.log` | game stdout/stderr |
+| `driver.log` | driver stdout/stderr |
 | `protocol.json` | copied protocol/session metadata |
 | `transcript.jsonl` | replayable request/response/timing envelopes |
-| `captures/` | live capture PNGs |
-| `screenshots/` | final copied PNGs for upload |
+| `captures/` | wrapper-exported fallback live capture dir |
+| `screenshots/` | final copied PNGs from the protocol `capture_dir` |
 | `failure-summary.txt` | failure reason, log tail, newest capture |
 
 `--game ... --driver ...` is the best mode for automation because the driver receives `BEVY_FEEDBACK_TRANSCRIPT`, so client commands are recorded in `transcript.jsonl`.
@@ -118,16 +127,16 @@ Raw JSON-lines also works:
 {"id":1,"command":"window_info"}
 {"id":2,"command":"click","x":320,"y":240,"button":"left"}
 {"id":3,"command":"key_hold","key":"KeyW","frames":30}
-{"id":4,"command":"capture"}
+{"id":4,"command":"capture","label":"default"}
 ```
 
 ## Clients
 
-Rust: `bevy_agent_feedback_plugin::client::AgentClient`.
-Python: `clients/python/bevy_feedback.py`; `skills/driving-bevy-games/drive.py` remains a compatibility wrapper.
-TypeScript: `clients/typescript/bevy_feedback.ts`, dependency-free (`node` with type stripping or `tsx`).
+Rust: `bevy_agent_feedback_plugin::client::AgentClient`, including `capture_labeled("name")`.
+Python: `clients/python/bevy_feedback.py`; wrap drivers in `bevy_feedback.run(main)` and use `fail("message")` for expected game/client failures without tracebacks. `capture(label="name")` names PNGs.
+TypeScript: `clients/typescript/bevy_feedback.ts`, dependency-free (`node` with type stripping or `tsx`), with `capture(label?)`.
 
-Rust/Python clients include pixel/OCR assertions. TypeScript v1 covers core driving only. All clients can replay transcript v1 envelopes (`request` + `response` + timing) and older request-only JSONL, and release held inputs on close. See [`skills/driving-bevy-games/SKILL.md`](skills/driving-bevy-games/SKILL.md) for driver workflow details.
+Rust/Python clients include pixel/OCR assertions. TypeScript covers core driving only. All clients can replay transcript envelopes (`request` + `response` + timing) and older request-only JSONL, and release held inputs on close. See [`skills/driving-bevy-games/SKILL.md`](skills/driving-bevy-games/SKILL.md) for the first-use workflow.
 
 ```ts
 import { BevyFeedbackClient } from "./clients/typescript/bevy_feedback.ts";

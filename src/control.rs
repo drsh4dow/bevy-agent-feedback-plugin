@@ -417,13 +417,14 @@ fn drain_agent_requests(
                     true
                 }
             }
-            AgentCommand::Capture => capture_primary_window(
+            AgentCommand::Capture { label } => capture_primary_window(
                 &mut commands,
                 &config,
                 &mut state,
                 &mut windows,
                 id,
                 responder,
+                label,
             ),
             AgentCommand::ReleaseAllInputs => match release_all_inputs_internal(
                 &mut windows,

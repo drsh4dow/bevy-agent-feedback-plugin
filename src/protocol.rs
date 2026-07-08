@@ -38,7 +38,9 @@ pub(crate) enum AgentCommand {
     Wait {
         frames: u16,
     },
-    Capture,
+    Capture {
+        label: Option<String>,
+    },
     ReleaseAllInputs,
     Shutdown,
     Click {
@@ -68,6 +70,8 @@ pub(crate) enum AgentCommand {
 pub(crate) struct CaptureInfo {
     pub(crate) sequence: u64,
     pub(crate) path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -117,6 +121,7 @@ pub(crate) struct AgentRequestBody {
 #[derive(Debug, PartialEq)]
 pub(crate) struct ParseRequestError {
     pub(crate) id: Value,
+    pub(crate) code: &'static str,
     pub(crate) message: String,
 }
 
@@ -170,7 +175,9 @@ enum WireCommand {
     Wait {
         frames: Option<u16>,
     },
-    Capture,
+    Capture {
+        label: Option<String>,
+    },
     ReleaseAllInputs,
     Shutdown,
     Click {
@@ -308,17 +315,20 @@ pub(crate) fn parse_request(
 ) -> Result<AgentRequestBody, ParseRequestError> {
     let value = serde_json::from_str::<Value>(line).map_err(|error| ParseRequestError {
         id: Value::Null,
+        code: "invalid_request",
         message: error.to_string(),
     })?;
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let request =
         serde_json::from_value::<WireRequest>(value).map_err(|error| ParseRequestError {
             id,
+            code: "invalid_request",
             message: error.to_string(),
         })?;
     let command = parse_wire_command(request.command, max_wait_frames, max_action_steps).map_err(
         |message| ParseRequestError {
             id: request.id.clone(),
+            code: "invalid_argument",
             message,
         },
     )?;
@@ -354,7 +364,9 @@ fn parse_wire_command(
         WireCommand::FileDrop { path } => AgentCommand::FileDrop { path },
         WireCommand::FileCancel => AgentCommand::FileCancel,
         WireCommand::WindowInfo => AgentCommand::WindowInfo,
-        WireCommand::Capture => AgentCommand::Capture,
+        WireCommand::Capture { label } => AgentCommand::Capture {
+            label: validate_capture_label(label)?,
+        },
         WireCommand::ReleaseAllInputs => AgentCommand::ReleaseAllInputs,
         WireCommand::Shutdown => AgentCommand::Shutdown,
         WireCommand::Wait { frames } => AgentCommand::Wait {
@@ -417,6 +429,21 @@ fn vec2(label: &str, x: f32, y: f32) -> Result<Vec2, String> {
         Ok(Vec2::new(x, y))
     } else {
         Err(format!("{label} must contain finite coordinates"))
+    }
+}
+
+fn validate_capture_label(label: Option<String>) -> Result<Option<String>, String> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    let valid = (1..=40).contains(&label.len())
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if valid {
+        Ok(Some(label))
+    } else {
+        Err("capture label must match [A-Za-z0-9_-]{1,40}".to_string())
     }
 }
 
@@ -527,7 +554,7 @@ pub(crate) fn write_protocol_file(
         "file_cancel": {},
         "window_info": {},
         "wait": { "frames": format!("1..={}", config.max_wait_frames) },
-        "capture": {},
+        "capture": { "label": "optional [A-Za-z0-9_-]{1,40}" },
         "ecs_summary": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
         "list_entities": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
         "camera_info": { "requires": "diagnostics feature and AgentFeedbackDiagnosticsPlugin" },
@@ -539,7 +566,7 @@ pub(crate) fn write_protocol_file(
         { "id": 2, "command": "click", "x": 320.0, "y": 240.0, "button": "left" },
         { "id": 3, "command": "drag", "from": [320.0, 240.0], "to": [420.0, 240.0], "button": "Right", "steps": 5, "frames": 5 },
         { "id": 4, "command": "key_tap", "key": "keyw" },
-        { "id": 5, "command": "capture" },
+        { "id": 5, "command": "capture", "label": "default" },
         { "id": 6, "command": "release_all_inputs" },
         { "id": 7, "command": "marker_info" },
         { "id": 8, "command": "shutdown" }
@@ -569,96 +596,4 @@ pub(crate) fn write_protocol_file(
 const MOUSE_BUTTON_NAMES: &[&str] = &["Left", "Right", "Middle", "Back", "Forward"];
 const MOUSE_SCROLL_UNIT_NAMES: &[&str] = &["Line", "Pixel"];
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{net::SocketAddr, time::Duration};
-
-    #[test]
-    fn parses_case_insensitive_input_names() {
-        let request = parse_request(
-            r#"{"id":1,"command":"click","x":12,"y":34,"button":"right"}"#,
-            10,
-            10,
-        )
-        .expect("valid request");
-
-        assert_eq!(request.id, Value::from(1));
-        assert_eq!(
-            request.command,
-            AgentCommand::Click {
-                position: Vec2::new(12.0, 34.0),
-                button: MouseButton::Right,
-                frames: 1,
-            }
-        );
-
-        let request = parse_request(r#"{"id":2,"command":"key_tap","key":"keyw"}"#, 10, 10)
-            .expect("valid request");
-        assert_eq!(
-            request.command,
-            AgentCommand::KeyHold {
-                key: KeyCode::KeyW,
-                frames: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn invalid_names_suggest_close_values() {
-        let error = parse_request(
-            r#"{"id":1,"command":"mouse_down","button":"rigth"}"#,
-            10,
-            10,
-        )
-        .expect_err("invalid button");
-        assert_eq!(error.id, Value::from(1));
-        assert!(error.message.contains("Right"));
-
-        let error = parse_request(
-            r#"{"id":"bad-scroll","command":"scroll","lines":1,"unit":"lien"}"#,
-            10,
-            10,
-        )
-        .expect_err("invalid scroll unit");
-        assert_eq!(error.id, Value::from("bad-scroll"));
-        assert!(error.message.contains("Line"));
-
-        let error = parse_request(r#"{"id":3,"command":"key_tap","key":"keyww"}"#, 10, 10)
-            .expect_err("invalid key");
-        assert_eq!(error.id, Value::from(3));
-        assert!(error.message.contains("KeyW"));
-    }
-
-    #[test]
-    fn rejects_wait_commands_outside_the_frame_bound() {
-        let error = parse_request(r#"{"id":"slow","command":"wait","frames":11}"#, 10, 10)
-            .expect_err("frame bound should be enforced");
-
-        assert_eq!(error.id, Value::from("slow"));
-        assert!(error.message.contains("frames"));
-    }
-
-    #[test]
-    fn writes_v2_protocol_with_session_metadata() {
-        let root =
-            std::env::temp_dir().join(format!("bevy-agent-protocol-{}", crate::session::unix_ms()));
-        let config = AgentFeedbackConfig {
-            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            protocol_file: root.join("agent.json"),
-            capture_dir: root.join("captures"),
-            command_timeout: Duration::from_secs(2),
-            ..Default::default()
-        };
-        let session = AgentFeedbackSession::new(&config);
-
-        write_protocol_file(&config, &session, SocketAddr::from(([127, 0, 0, 1], 12345)))
-            .expect("protocol");
-
-        let protocol: Value = serde_json::from_slice(&fs::read(&config.protocol_file).unwrap())
-            .expect("protocol json");
-        assert_eq!(protocol["protocol"], PROTOCOL_VERSION);
-        assert_eq!(protocol["session_id"], session.session_id);
-        assert!(session.heartbeat_file.exists());
-        let _ = fs::remove_dir_all(root);
-    }
-}
+mod tests;

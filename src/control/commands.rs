@@ -392,6 +392,7 @@ pub(super) fn capture_primary_window(
     windows: &mut Query<(Entity, &mut Window), With<PrimaryWindow>>,
     id: Value,
     responder: SyncSender<AgentResponse>,
+    label: Option<String>,
 ) -> bool {
     if let Err(error) = fs::create_dir_all(&config.capture_dir) {
         let _ = responder.send(AgentResponse::error(
@@ -406,12 +407,15 @@ pub(super) fn capture_primary_window(
     let snapshot = Some(snapshot(state, window));
     let sequence = state.next_capture;
     state.next_capture += 1;
-    let path = config
-        .capture_dir
-        .join(format!("capture-{sequence:06}.png"));
+    let filename = match &label {
+        Some(label) => format!("capture-{sequence:06}-{label}.png"),
+        None => format!("capture-{sequence:06}.png"),
+    };
+    let path = config.capture_dir.join(filename);
     let capture = CaptureInfo {
         sequence,
         path: path.to_string_lossy().into_owned(),
+        label,
     };
     let max_captures = config.max_captures.max(1);
 

@@ -8,7 +8,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, NoReturn
 
 PROTOCOL_VERSION = "bevy-agent-feedback/2"
 
@@ -119,8 +119,11 @@ class BevyFeedbackClient:
     def wait(self, frames: int = 1) -> dict[str, Any]:
         return self.request({"command": "wait", "frames": frames})
 
-    def capture(self) -> Path:
-        response = self.request({"command": "capture"})
+    def capture(self, label: str | None = None) -> Path:
+        request: dict[str, Any] = {"command": "capture"}
+        if label is not None:
+            request["label"] = label
+        response = self.request(request)
         self._last_capture = Path(response["result"]["capture"]["path"])
         return self._last_capture
 
@@ -234,10 +237,17 @@ class BevyFeedbackClient:
                 f"color {rgb} found {found} pixels, expected at least {min_pixels}: {path}"
             )
 
-    def wait_until_changed(self, before: str | os.PathLike[str], *, frames: int = 1, attempts: int = 30) -> Path:
+    def wait_until_changed(
+        self,
+        before: str | os.PathLike[str],
+        *,
+        frames: int = 1,
+        attempts: int = 30,
+        label: str | None = None,
+    ) -> Path:
         for _ in range(attempts):
             self.wait(frames)
-            after = self.capture()
+            after = self.capture(label)
             if pixel_diff(before, after) > 0:
                 return after
         raise BevyFeedbackError("screenshot did not change")
@@ -250,10 +260,11 @@ class BevyFeedbackClient:
         tolerance: int = 0,
         frames: int = 1,
         attempts: int = 30,
+        label: str | None = None,
     ) -> Path:
         for _ in range(attempts):
             self.wait(frames)
-            capture = self.capture()
+            capture = self.capture(label)
             if image_has_color(capture, color, region, tolerance):
                 return capture
         raise BevyFeedbackError(f"color did not appear: {color}")
@@ -282,10 +293,17 @@ class BevyFeedbackClient:
         if expected not in text:
             raise BevyFeedbackError(f"OCR text did not contain {expected!r}: {text}")
 
-    def wait_until_text(self, expected: str, *, frames: int = 1, attempts: int = 30) -> Path:
+    def wait_until_text(
+        self,
+        expected: str,
+        *,
+        frames: int = 1,
+        attempts: int = 30,
+        label: str | None = None,
+    ) -> Path:
         for _ in range(attempts):
             self.wait(frames)
-            capture = self.capture()
+            capture = self.capture(label)
             try:
                 self.assert_text(capture, expected)
                 return capture
@@ -332,8 +350,13 @@ class BevyFeedbackClient:
         return message
 
     def _read_protocol(self) -> dict[str, Any]:
-        with open(self.protocol_file, encoding="utf-8") as handle:
-            protocol = json.load(handle)
+        try:
+            with open(self.protocol_file, encoding="utf-8") as handle:
+                protocol = json.load(handle)
+        except FileNotFoundError as error:
+            raise BevyFeedbackError(
+                f"protocol file not found at {self.protocol_file}; is the game running under 'bevy-feedback run'?"
+            ) from error
         version = protocol.get("protocol")
         if version != PROTOCOL_VERSION:
             raise BevyFeedbackError(f"unsupported protocol {version!r}; expected {PROTOCOL_VERSION}")
@@ -434,6 +457,21 @@ def _process_alive(pid: int) -> bool:
         except OSError:
             return False
     return True
+
+
+def fail(message: str) -> NoReturn:
+    raise BevyFeedbackError(message)
+
+
+def run(driver: Callable[[BevyFeedbackClient], None]) -> NoReturn:
+    try:
+        with BevyFeedbackClient() as client:
+            driver(client)
+    except (BevyFeedbackError, OSError, KeyboardInterrupt) as error:
+        print(json.dumps({"ok": False, "error": str(error)}, separators=(",", ":")))
+        raise SystemExit(1)
+    print(json.dumps({"ok": True}, separators=(",", ":")))
+    raise SystemExit(0)
 
 
 def drive_stdio(protocol_file: str | os.PathLike[str], lines: Iterable[str]) -> int:
