@@ -16,6 +16,8 @@ jobs:
           sudo apt-get install -y clang mold libx11-dev libwayland-dev libasound2-dev libudev-dev pkg-config
       - run: rustup component add rustfmt clippy rustc-codegen-cranelift
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ false }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
@@ -28,6 +30,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ false }}
       # Keep package details in docs/ci-linux.md.
       - name: Install Linux display dependencies
         run: |
