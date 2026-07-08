@@ -8,7 +8,7 @@ Ubuntu-style baseline:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y clang mold xvfb libx11-dev libasound2-dev libudev-dev pkg-config
+sudo apt-get install -y clang mold xvfb libx11-dev libwayland-dev libasound2-dev libudev-dev pkg-config
 # Optional OCR assertions:
 sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
 ```
