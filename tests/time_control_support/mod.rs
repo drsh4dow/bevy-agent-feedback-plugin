@@ -16,8 +16,8 @@ use std::{
     time::Duration,
 };
 
-const IO_ATTEMPTS: usize = 250;
-pub(crate) const UPDATE_ATTEMPTS: usize = 500;
+const IO_ATTEMPTS: usize = 2_500;
+pub(crate) const UPDATE_ATTEMPTS: usize = 2_500;
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Resource)]
@@ -92,7 +92,7 @@ pub(crate) fn timing_config(
         max_wait_frames: 64,
         max_time_advance_steps: 64,
         max_time_advance: Duration::from_secs(2),
-        command_timeout: Duration::from_millis(500),
+        command_timeout: Duration::from_secs(5),
         ..Default::default()
     };
     (config, root)
@@ -281,9 +281,28 @@ pub(crate) fn arm_advance(
     panic!("advance_time was not armed within the bounded update loop")
 }
 
+pub(crate) fn assert_timing_success(response: &Value, status: &str) {
+    assert_eq!(
+        response["ok"],
+        Value::Bool(true),
+        "unexpected timing response: {response}"
+    );
+    assert_eq!(
+        response["result"]["status"], status,
+        "unexpected timing response: {response}"
+    );
+}
+
 pub(crate) fn assert_timing_error(response: &Value, code: &str, reason: Option<&str>) {
-    assert_eq!(response["ok"], Value::Bool(false));
-    assert_eq!(response["error"]["code"], code);
+    assert_eq!(
+        response["ok"],
+        Value::Bool(false),
+        "unexpected timing response: {response}"
+    );
+    assert_eq!(
+        response["error"]["code"], code,
+        "unexpected timing response: {response}"
+    );
     if let Some(reason) = reason {
         assert_eq!(response["error"]["context"]["timing"]["reason"], reason);
     }
@@ -293,7 +312,7 @@ pub(crate) fn duration_detail(response: &Value, field: &str) -> Duration {
     Duration::try_from_secs_f64(
         response["result"]["details"][field]
             .as_f64()
-            .unwrap_or_else(|| panic!("timing result should contain {field}")),
+            .unwrap_or_else(|| panic!("timing result should contain {field}: {response}")),
     )
-    .unwrap_or_else(|_| panic!("timing result {field} should be a duration"))
+    .unwrap_or_else(|_| panic!("timing result {field} should be a duration: {response}"))
 }

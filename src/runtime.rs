@@ -14,7 +14,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -294,8 +294,12 @@ fn wait_for_response(
     canceled: &AtomicBool,
 ) -> io::Result<()> {
     let start = Instant::now();
-    while start.elapsed() < command_timeout {
-        match response_receiver.recv_timeout(Duration::from_millis(20)) {
+    loop {
+        let remaining = command_timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match response_receiver.recv_timeout(remaining.min(Duration::from_millis(20))) {
             Ok(response) => return write_response(stream, &response),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if socket_closed(stream) {
@@ -311,18 +315,26 @@ fn wait_for_response(
             }
         }
     }
-    canceled.store(true, Ordering::Release);
-    write_response(
-        stream,
-        &AgentResponse::error(
-            id,
-            "timeout",
-            format!(
-                "game did not answer within {} ms",
-                command_timeout.as_millis()
-            ),
-        ),
-    )
+    match response_receiver.try_recv() {
+        Ok(response) => write_response(stream, &response),
+        Err(TryRecvError::Disconnected) => {
+            write_response(stream, &AgentResponse::error(id, "closed", QUEUE_CLOSED))
+        }
+        Err(TryRecvError::Empty) => {
+            canceled.store(true, Ordering::Release);
+            write_response(
+                stream,
+                &AgentResponse::error(
+                    id,
+                    "timeout",
+                    format!(
+                        "game did not answer within {} ms",
+                        command_timeout.as_millis()
+                    ),
+                ),
+            )
+        }
+    }
 }
 
 fn socket_closed(stream: &TcpStream) -> bool {
@@ -353,5 +365,55 @@ struct DisconnectReleaseGuard {
 impl Drop for DisconnectReleaseGuard {
     fn drop(&mut self) {
         self.release_on_disconnect.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn queued_response_wins_at_zero_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local response socket");
+        listener
+            .set_nonblocking(true)
+            .expect("bound local response accept");
+        let address = listener.local_addr().expect("local response address");
+        let client = TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .expect("connect local response socket");
+        let (mut server, _) = listener.accept().expect("accept local response socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound response read");
+        server
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("bound response write");
+
+        let (response_sender, response_receiver) = sync_channel(1);
+        response_sender
+            .try_send(AgentResponse::ok(json!(17), "queued", None, None))
+            .expect("prequeue response");
+        let canceled = AtomicBool::new(false);
+
+        wait_for_response(
+            &mut server,
+            response_receiver,
+            json!(17),
+            Duration::ZERO,
+            &canceled,
+        )
+        .expect("write prequeued response");
+
+        assert!(!canceled.load(Ordering::Acquire));
+        let mut line = String::new();
+        BufReader::new(client)
+            .read_line(&mut line)
+            .expect("read prequeued response");
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).expect("response JSON"),
+            json!({"id": 17, "ok": true, "result": {"status": "queued"}})
+        );
     }
 }

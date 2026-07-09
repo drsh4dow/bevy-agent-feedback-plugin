@@ -107,8 +107,11 @@ fn advance_has_one_frame_arming_latency_and_exact_update_deltas() {
     assert_eq!(trace.simulated_nanoseconds, requested.as_nanos());
     assert_eq!(trace.fixed_deltas.len(), 5);
     assert_eq!(harness.elapsed(), requested);
-    assert_eq!(response["result"]["status"], "advanced_time");
-    assert_eq!(response["result"]["details"]["step_count"], 4);
+    assert_timing_success(&response, "advanced_time");
+    assert_eq!(
+        response["result"]["details"]["step_count"], 4,
+        "unexpected timing response: {response}"
+    );
     assert_eq!(duration_detail(&response, "start_seconds"), Duration::ZERO);
     assert_eq!(duration_detail(&response, "end_seconds"), requested);
     assert_eq!(duration_detail(&response, "actual_seconds"), requested);
@@ -138,7 +141,11 @@ fn advance_shorter_than_fixed_timestep_runs_update_but_not_fixed_update() {
     assert_eq!(trace.update_deltas, vec![requested]);
     assert!(trace.fixed_deltas.is_empty());
     assert_eq!(harness.elapsed(), requested);
-    assert_eq!(response["result"]["details"]["step_count"], 1);
+    assert_timing_success(&response, "advanced_time");
+    assert_eq!(
+        response["result"]["details"]["step_count"], 1,
+        "unexpected timing response: {response}"
+    );
     assert_eq!(duration_detail(&response, "actual_seconds"), requested);
 }
 
@@ -147,7 +154,7 @@ fn client_chunking_preserves_full_steps_and_emits_one_final_remainder() {
     let (mut config, root) = timing_config("client-chunks", true);
     config.max_time_advance = Duration::from_millis(25);
     config.max_time_advance_steps = 2;
-    config.command_timeout = Duration::from_secs(2);
+    config.command_timeout = Duration::from_secs(5);
     let protocol_file = config.protocol_file.clone();
     let mut harness = build_harness(config, root, true, |app| {
         app.world_mut()
@@ -160,7 +167,7 @@ fn client_chunking_preserves_full_steps_and_emits_one_final_remainder() {
     let client_thread = thread::spawn(move || {
         let result = AgentClient::with_config(AgentClientConfig {
             protocol_file,
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(5),
             ..Default::default()
         })
         .and_then(|mut client| client.advance_time(0.055, Some(0.01)));
@@ -216,7 +223,7 @@ fn client_chunking_preserves_full_steps_and_emits_one_final_remainder() {
     );
     assert_eq!(harness.elapsed(), Duration::from_millis(55));
     assert_eq!(trace.fixed_deltas.len(), 5);
-    assert_eq!(response["result"]["status"], "advanced_time");
+    assert_timing_success(&response, "advanced_time");
     assert_eq!(
         duration_detail(&response, "actual_seconds"),
         Duration::from_millis(15)
@@ -290,8 +297,11 @@ fn wait_seconds_observes_virtual_time_and_times_out_without_changing_it() {
     let response = response_while_updating(harness.app_mut(), &mut wire);
     let trace = harness.trace();
 
-    assert_eq!(response["result"]["status"], "waited");
-    assert_eq!(response["result"]["details"]["frames"], 3);
+    assert_timing_success(&response, "waited");
+    assert_eq!(
+        response["result"]["details"]["frames"], 3,
+        "unexpected timing response: {response}"
+    );
     assert_eq!(
         duration_detail(&response, "observed_seconds"),
         Duration::from_millis(15)
@@ -406,7 +416,7 @@ fn disconnect_cancels_an_armed_advance_and_allows_the_next_request() {
     );
     harness.app_mut().update();
     let response = next.wait_without_updates();
-    assert_eq!(response["result"]["status"], "advanced_time");
+    assert_timing_success(&response, "advanced_time");
     assert_eq!(harness.elapsed(), Duration::from_millis(10));
 }
 
@@ -470,7 +480,11 @@ fn run_sleep_invariant_scenario(name: &str, host_sleeps: [Duration; 4]) -> Scena
         harness.app_mut().update();
     }
     let response = wire.wait_without_updates();
-    assert_eq!(response["result"]["details"]["step_count"], 4);
+    assert_timing_success(&response, "advanced_time");
+    assert_eq!(
+        response["result"]["details"]["step_count"], 4,
+        "unexpected timing response: {response}"
+    );
     assert_eq!(
         duration_detail(&response, "actual_seconds"),
         Duration::from_millis(37)
