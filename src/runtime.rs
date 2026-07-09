@@ -224,6 +224,8 @@ fn handle_client(
     }
 }
 
+const QUEUE_CLOSED: &str = "game command queue is closed; game likely exited - check game.log";
+
 fn handle_line(
     line: &str,
     stream: &mut TcpStream,
@@ -256,7 +258,7 @@ fn handle_line(
         ),
         Err(TrySendError::Disconnected(request)) => write_response(
             stream,
-            &AgentResponse::error(request.id, "closed", "game command queue is closed"),
+            &AgentResponse::error(request.id, "closed", QUEUE_CLOSED),
         ),
     }
 }
@@ -280,10 +282,7 @@ fn wait_for_response(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return write_response(
-                    stream,
-                    &AgentResponse::error(id, "closed", "game command queue is closed"),
-                );
+                return write_response(stream, &AgentResponse::error(id, "closed", QUEUE_CLOSED));
             }
         }
     }

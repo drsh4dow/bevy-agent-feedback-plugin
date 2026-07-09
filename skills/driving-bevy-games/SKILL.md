@@ -10,19 +10,18 @@ description: Drive a running Bevy game through the bevy-agent-feedback-plugin so
 ```sh
 cargo install bevy-agent-feedback-plugin
 bevy-feedback --version
-PYTHONPATH=<path-to-this-skill-dir> bevy-feedback doctor
+bevy-feedback doctor
 ```
 
 2. Run game + driver:
 
 ```sh
-PYTHONPATH=<path-to-this-skill-dir> \
 bevy-feedback run --ready-timeout 180000 \
   --game cargo run --features agent \
   --driver python3 tests/drive_smoke.py
 ```
 
-`skill://driving-bevy-games` is a skill reference, NOT a Python import path. `PYTHONPATH` must be the real directory containing `bevy_feedback.py`, usually `.agents/skills/driving-bevy-games`.
+`bevy-feedback run` and `doctor` inject the bundled Python client automatically; `PYTHONPATH` is not required. Set `PYTHONPATH` to this skill directory only when running a driver script by hand outside `bevy-feedback run`.
 
 `protocol ready != game ready`: the socket exists; assets, menus, save data, and cameras may still be loading. Wait for a stable frame before acting.
 
@@ -35,8 +34,9 @@ import bevy_feedback
 from bevy_feedback import BevyFeedbackClient, fail
 
 def main(game: BevyFeedbackClient) -> None:
-    loading = game.capture(label="loading")
-    first = game.wait_until_changed(loading, frames=30, attempts=60, label="default")
+    ready = game.wait_until_stable(frames=15, attempts=40, label="boot")
+    game.click(*game.point(0.50, 0.50))  # click(x, y, button="Left"); point() maps fractions to logical pixels
+    game.wait(10)
     before = game.capture(label="before_drag")
     game.drag("Left", game.window_center(), game.point(0.90, 0.50), steps=30, frames=45)
     game.wait(10)
@@ -44,7 +44,7 @@ def main(game: BevyFeedbackClient) -> None:
     game.assert_changed(before, after, min_pixels=1)
     if not Path(after).exists():
         fail(f"missing final capture: {after}")
-    print(json.dumps({"loading": str(loading), "default": str(first), "before_drag": str(before), "after_drag": str(after)}))
+    print(json.dumps({"boot": str(ready), "before_drag": str(before), "after_drag": str(after)}))
 
 bevy_feedback.run(main)
 ```
@@ -89,11 +89,12 @@ Use diagnostics only for ECS/state/marker queries. Done when `cargo check --feat
 
 ## Readiness
 
-No diagnostics: pixels are truth. Capture loading, wait for change, then optionally wait for a known color:
+No diagnostics: pixels are truth. `wait_until_stable` settles boot; `wait_until_changed` verifies act→react (fails on an already-settled screen).
 
 ```python
-loading = game.capture(label="loading")
-ready = game.wait_until_changed(loading, frames=30, attempts=60, label="ready")
+ready = game.wait_until_stable(frames=15, attempts=40, label="ready")
+game.click(*game.point(0.50, 0.50))
+changed = game.wait_until_changed(ready, frames=10, attempts=30, label="after_click")
 game.wait_until_color((255, 255, 255), (20, 20, 120, 40), tolerance=10, attempts=30, label="hud")
 ```
 
@@ -102,8 +103,10 @@ Diagnostics: recommended when waiting on Bevy states. Add `AgentFeedbackDiagnost
 ## Assertions & inputs
 
 Use look → act → look. Trust a command only after a pixel/color/text/diagnostic check.
+Clicks work on unmodified idiomatic games as of this plugin version: synthetic input syncs `Window::cursor_position`.
 
 - Prefer `click`, `drag`, `scroll`, `key_tap`, `key_hold`; they auto-release.
+- `click(x, y, button="Left")` takes logical pixel coords; fractional: `game.click(*game.point(fx, fy))`. Button first fails: `invalid type: string "Left", expected f32`.
 - Coordinates are logical pixels, origin top-left. Use `window_center()` and `point(frac_x, frac_y)` for portable smoke tests.
 - Labeled captures use `[A-Za-z0-9_-]{1,40}` and produce `capture-000123-label.png`.
 - Use `fail("message")`; `bevy_feedback.run(main)` prints one-line JSON and hides expected game/client tracebacks.
@@ -139,7 +142,7 @@ The wrapper releases inputs and sends `shutdown`. Manual clients should send `re
 | `protocol file not found` | start the game through `bevy-feedback run` |
 | readiness timeout | increase `--ready-timeout MS`; clean Bevy builds can exceed 60s |
 | stale protocol | stop old games; clients reject stale pid/heartbeat data |
-| `import bevy_feedback` fails | set `PYTHONPATH` to the real skill directory |
+| `import bevy_feedback` fails | `bevy-feedback run` injects the bundled client; for manual scripts, set `PYTHONPATH` to the real skill directory |
 | no screenshots in artifacts | inspect `protocol.json.capture_dir`; wrapper copies that directory |
 | OCR errors | install Pillow for crops; install `tesseract` plus language data |
 | no display/CI | use a real display, Wayland, or `xvfb-run -s '-screen 0 1280x720x24'` |

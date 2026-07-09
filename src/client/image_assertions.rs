@@ -18,7 +18,7 @@ pub(super) fn diff_images(
 ) -> Result<u64, ClientError> {
     if a.dimensions() != b.dimensions() {
         return Err(ClientError::Assertion(format!(
-            "image dimensions differ: {:?} vs {:?}",
+            "image dimensions differ: {:?} vs {:?} (window resized; wait_until_stable + re-capture)",
             a.dimensions(),
             b.dimensions()
         )));

@@ -84,6 +84,17 @@ fn socket_cursor_move_updates_window_and_returns_metadata() {
         response["result"]["mouse_position"],
         Value::Array(vec![Value::from(320.0), Value::from(240.0)])
     );
+    assert_eq!(
+        response["result"]["window"]["cursor_position"],
+        serde_json::json!([320.0, 240.0])
+    );
+    let mut windows = app
+        .world_mut()
+        .query_filtered::<&Window, With<PrimaryWindow>>();
+    assert_eq!(
+        windows.single(app.world()).unwrap().cursor_position(),
+        Some(Vec2::new(320.0, 240.0))
+    );
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
 
@@ -181,6 +192,13 @@ fn high_level_actions_release_after_requested_frames() {
         !app.world()
             .resource::<ButtonInput<MouseButton>>()
             .pressed(MouseButton::Left)
+    );
+    let mut windows = app
+        .world_mut()
+        .query_filtered::<&Window, With<PrimaryWindow>>();
+    assert_eq!(
+        windows.single(app.world()).unwrap().cursor_position(),
+        Some(Vec2::new(320.0, 240.0))
     );
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
@@ -388,6 +406,23 @@ fn labeled_capture_uses_label_in_filename_and_response() {
         expected_path
     );
     assert!(expected_path.exists());
+    let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
+}
+
+#[test]
+fn capture_without_primary_window_returns_missing_window() {
+    let (mut app, config) = agent_app("capture-missing-window");
+    let mut stream = connect(&config);
+    let mut windows = app
+        .world_mut()
+        .query_filtered::<Entity, With<PrimaryWindow>>();
+    let window_entity = windows.single(app.world()).expect("primary window");
+    app.world_mut().despawn(window_entity);
+
+    let response = send(&mut app, &mut stream, r#"{"id":1,"command":"capture"}"#);
+
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert_eq!(response["error"]["code"], "missing_window");
     let _ = fs::remove_dir_all(config.protocol_file.parent().unwrap());
 }
 

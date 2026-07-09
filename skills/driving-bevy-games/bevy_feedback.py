@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, NoReturn
 
 PROTOCOL_VERSION = "bevy-agent-feedback/2"
+DEFAULT_MAX_WAIT_FRAMES = 300
 
 
 class BevyFeedbackError(RuntimeError):
@@ -44,6 +45,7 @@ class BevyFeedbackClient:
         self._transcript = open(transcript, "a", encoding="utf-8") if transcript else None
         protocol = self._read_protocol()
         self.capture_dir = Path(protocol.get("capture_dir", "."))
+        self.max_wait_frames = int(protocol.get("max_wait_frames", DEFAULT_MAX_WAIT_FRAMES))
         host, port = protocol["socket_addr"].rsplit(":", 1)
         try:
             self._socket = socket.create_connection((host, int(port)), timeout=timeout)
@@ -117,7 +119,17 @@ class BevyFeedbackClient:
         return responses
 
     def wait(self, frames: int = 1) -> dict[str, Any]:
-        return self.request({"command": "wait", "frames": frames})
+        """Advance frames; requests above the server's max_wait_frames cap are chunked."""
+        cap = max(1, int(getattr(self, "max_wait_frames", DEFAULT_MAX_WAIT_FRAMES)))
+        if frames <= cap:
+            return self.request({"command": "wait", "frames": frames})
+        response: dict[str, Any] = {}
+        remaining = frames
+        while remaining > 0:
+            step = min(remaining, cap)
+            response = self.request({"command": "wait", "frames": step})
+            remaining -= step
+        return response
 
     def capture(self, label: str | None = None) -> Path:
         request: dict[str, Any] = {"command": "capture"}
@@ -252,6 +264,42 @@ class BevyFeedbackClient:
                 return after
         raise BevyFeedbackError("screenshot did not change")
 
+    def wait_until_stable(
+        self,
+        *,
+        frames: int = 10,
+        attempts: int = 30,
+        stable: int = 2,
+        label: str | None = None,
+    ) -> Path:
+        """Wait until `stable` consecutive captures are pixel-identical; returns the last capture.
+
+        Use after boot instead of wait_until_changed: a settled static screen passes
+        immediately instead of burning the full attempts budget.
+        """
+        stable = max(1, stable)
+        previous = self.capture(label)
+        streak = 0
+        for _ in range(attempts):
+            self.wait(frames)
+            current = self.capture(label)
+            try:
+                changed = pixel_diff(previous, current)
+            except BevyFeedbackError as error:
+                if "image dimensions differ" not in str(error):
+                    raise
+                changed = 1
+            if changed == 0:
+                streak += 1
+                if streak >= stable:
+                    return current
+            else:
+                streak = 0
+            previous = current
+        raise BevyFeedbackError(
+            f"screen did not stabilize after {attempts} polls of {frames} frames"
+        )
+
     def wait_until_color(
         self,
         color: tuple[int, int, int],
@@ -383,7 +431,7 @@ def pixel_diff(a: str | os.PathLike[str], b: str | os.PathLike[str], region: tup
     image_a = Image.open(a).convert("RGBA")
     image_b = Image.open(b).convert("RGBA")
     if image_a.size != image_b.size:
-        raise BevyFeedbackError(f"image dimensions differ: {image_a.size} vs {image_b.size}")
+        raise BevyFeedbackError(f"image dimensions differ: {image_a.size} vs {image_b.size} (window resized; wait_until_stable + re-capture)")
     x, y, width, height = region or (0, 0, image_a.width, image_a.height)
     changed = 0
     for py in range(y, y + height):

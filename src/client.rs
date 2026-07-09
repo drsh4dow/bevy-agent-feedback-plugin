@@ -1,14 +1,15 @@
 //! Rust client for the v2 agent feedback protocol.
 
-use crate::session::{PROTOCOL_VERSION, unix_ms};
-use serde::Deserialize;
+#[cfg(test)]
+use crate::session::PROTOCOL_VERSION;
+use crate::session::unix_ms;
 use serde_json::{Value, json};
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
-    net::{SocketAddr, TcpStream},
+    net::TcpStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -95,6 +96,7 @@ pub struct AgentClient {
     transcript: Option<File>,
     last_capture: Option<PathBuf>,
     ocr: OcrOptions,
+    max_wait_frames: u16,
 }
 
 /// Client failure.
@@ -187,6 +189,7 @@ impl AgentClient {
             transcript,
             last_capture: None,
             ocr: config.ocr,
+            max_wait_frames: protocol.max_wait_frames.max(1),
         })
     }
 
@@ -291,9 +294,20 @@ impl AgentClient {
         Ok(capture)
     }
 
-    /// Waits for `frames` Bevy frames.
+    /// Waits for `frames` Bevy frames, chunking requests above the server cap.
     pub fn wait(&mut self, frames: u16) -> Result<Value, ClientError> {
-        self.request(json!({"command": "wait", "frames": frames}))
+        let cap = self.max_wait_frames;
+        if frames <= cap {
+            return self.request(json!({"command": "wait", "frames": frames}));
+        }
+        let mut response = Value::Null;
+        let mut remaining = frames;
+        while remaining > 0 {
+            let step = remaining.min(cap);
+            response = self.request(json!({"command": "wait", "frames": step}))?;
+            remaining -= step;
+        }
+        Ok(response)
     }
 
     /// Moves the cursor in logical window coordinates.
@@ -480,6 +494,46 @@ impl AgentClient {
         ))
     }
 
+    /// Waits until `stable_polls` consecutive captures are pixel-identical; returns the last capture.
+    ///
+    /// Use after boot instead of `wait_until_changed`: a settled static screen
+    /// passes immediately instead of burning the full attempts budget.
+    pub fn wait_until_stable(
+        &mut self,
+        frames_per_poll: u16,
+        attempts: u16,
+        stable_polls: u16,
+    ) -> Result<Capture, ClientError> {
+        let stable_polls = stable_polls.max(1);
+        let mut previous = self.capture()?;
+        let mut streak = 0u16;
+        for _ in 0..attempts {
+            self.wait(frames_per_poll)?;
+            let current = self.capture()?;
+            let previous_dimensions = image::image_dimensions(&previous.path)
+                .map_err(|error| ClientError::Assertion(error.to_string()))?;
+            let current_dimensions = image::image_dimensions(&current.path)
+                .map_err(|error| ClientError::Assertion(error.to_string()))?;
+            let changed = if previous_dimensions == current_dimensions {
+                Self::pixel_diff(&previous.path, &current.path)?
+            } else {
+                1
+            };
+            if changed == 0 {
+                streak += 1;
+                if streak >= stable_polls {
+                    return Ok(current);
+                }
+            } else {
+                streak = 0;
+            }
+            previous = current;
+        }
+        Err(ClientError::Assertion(format!(
+            "screen did not stabilize after {attempts} polls"
+        )))
+    }
+
     /// Captures until a color appears in a pixel region.
     pub fn wait_until_color(
         &mut self,
@@ -572,69 +626,6 @@ impl Drop for AgentClient {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ProtocolFile {
-    socket_addr: SocketAddr,
-    pid: u32,
-    heartbeat_file: PathBuf,
-    stale_after_ms: u64,
-}
-
-fn read_protocol(path: &Path) -> Result<ProtocolFile, ClientError> {
-    let bytes = fs::read(path).map_err(|error| {
-        ClientError::Protocol(format!(
-            "failed to read protocol file {}: {error}",
-            path.display()
-        ))
-    })?;
-    let value: Value = serde_json::from_slice(&bytes)?;
-    let Some(version) = value["protocol"].as_str() else {
-        return Err(ClientError::Protocol(format!(
-            "unknown protocol file {}; missing protocol, expected {PROTOCOL_VERSION}",
-            path.display()
-        )));
-    };
-    if version != PROTOCOL_VERSION {
-        return Err(ClientError::Protocol(format!(
-            "unsupported protocol '{version}'; expected {PROTOCOL_VERSION}"
-        )));
-    }
-    let protocol: ProtocolFile = serde_json::from_value(value)?;
-    if !process_alive(protocol.pid) {
-        return Err(ClientError::Protocol(format!(
-            "protocol stale: process {} is not alive",
-            protocol.pid
-        )));
-    }
-    let heartbeat = fs::read_to_string(&protocol.heartbeat_file).map_err(|error| {
-        ClientError::Protocol(format!(
-            "protocol stale: failed to read heartbeat {}: {error}",
-            protocol.heartbeat_file.display()
-        ))
-    })?;
-    let heartbeat_ms = heartbeat.trim().parse::<u128>().map_err(|error| {
-        ClientError::Protocol(format!("protocol stale: heartbeat is invalid: {error}"))
-    })?;
-    let age = unix_ms().saturating_sub(heartbeat_ms);
-    if age > u128::from(protocol.stale_after_ms) {
-        return Err(ClientError::Protocol(format!(
-            "protocol stale: heartbeat is {age} ms old, stale after {} ms",
-            protocol.stale_after_ms
-        )));
-    }
-    Ok(protocol)
-}
-
-fn socket_error(error: io::Error, socket_addr: &SocketAddr) -> ClientError {
-    if error.kind() == io::ErrorKind::ConnectionRefused {
-        ClientError::Protocol(format!(
-            "socket refused at {socket_addr}; game probably exited"
-        ))
-    } else {
-        ClientError::Io(format!("connect {socket_addr}: {error}"))
-    }
-}
-
 fn capture_from_response(response: &Value) -> Result<Capture, ClientError> {
     let capture = &response["result"]["capture"];
     let sequence = capture["sequence"].as_u64().ok_or_else(|| {
@@ -656,20 +647,8 @@ use image_assertions::{
     color_pixel_count, diff_images, image_error, image_has_color, normalize_text, run_tesseract,
     validate_region,
 };
-
-fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Path::new("/proc").join(pid.to_string()).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
-}
+mod protocol_file;
+use protocol_file::{read_protocol, socket_error};
 
 #[cfg(test)]
 mod tests;

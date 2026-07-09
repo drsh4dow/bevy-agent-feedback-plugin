@@ -1,6 +1,6 @@
 [package]
 name = "bevy-agent-feedback-plugin"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Let AI coding agents see and control your Bevy app: input injection, labeled screenshots, and frame-synced feedback over a JSON-lines TCP protocol."
 readme = "README.md"
@@ -13,7 +13,7 @@ categories = [
   "game-development",
   "development-tools::debugging",
 ]
-exclude = ["docs/", "skills/", "clients/", "scripts/", "tests/"]
+exclude = ["docs/", "skills/", "clients/typescript/", "clients/python/__pycache__/", "scripts/", "tests/"]
 license = "MIT"
 
 [dependencies]

@@ -1,8 +1,10 @@
 mod args;
 mod doctor;
+mod python_client;
 
 use args::{Command as CliCommand, RunArgs};
 use bevy_agent_feedback_plugin::client::{AgentClient, AgentClientConfig};
+use python_client::BundledPythonClient;
 use serde_json::Value;
 use std::{
     fs::{self, File},
@@ -45,6 +47,8 @@ fn real_main() -> Result<ExitCode, String> {
 
 fn run(args: RunArgs) -> Result<(), String> {
     fs::create_dir_all(&args.artifacts).map_err(|error| error.to_string())?;
+    let python = BundledPythonClient::materialize(&args.artifacts.join("python"))
+        .map_err(|error| error.to_string())?;
     if let Some(parent) = args.protocol_file.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -64,6 +68,7 @@ fn run(args: RunArgs) -> Result<(), String> {
         "--game",
         &args.game,
         &args,
+        &python,
         &wrapper_capture_dir,
         &transcript_file,
         true,
@@ -103,6 +108,7 @@ fn run(args: RunArgs) -> Result<(), String> {
         .unwrap_or_else(|| wrapper_capture_dir.clone());
 
     let mut game_status = None;
+    let mut game_exit_noted = false;
     let mut failure_summary = String::new();
     let mut driver_failed = false;
     let mut driver_log = None;
@@ -115,6 +121,7 @@ fn run(args: RunArgs) -> Result<(), String> {
             "--driver",
             driver,
             &args,
+            &python,
             &wrapper_capture_dir,
             &transcript_file,
             true,
@@ -137,6 +144,13 @@ fn run(args: RunArgs) -> Result<(), String> {
                 let _ = driver.wait();
             }
         }
+        if let Ok(Some(status)) = game.try_wait() {
+            game_exit_noted = true;
+            game_status = Some(status);
+            failure_summary.push_str(&format!(
+                "game exited during the run with status {status} (before shutdown was requested); see game.log tail below\n"
+            ));
+        }
         driver_log = Some(path);
     } else {
         game_status = wait_game_or_signal(&mut game, &stop).map_err(|error| error.to_string())?;
@@ -157,7 +171,10 @@ fn run(args: RunArgs) -> Result<(), String> {
         copy_captures(&live_capture_dir, &screenshot_dir).map_err(|error| error.to_string())?;
 
     let game_failed = game_status.as_ref().is_some_and(|status| !status.success());
-    if game_failed && let Some(status) = &game_status {
+    if game_failed
+        && !game_exit_noted
+        && let Some(status) = &game_status
+    {
         failure_summary.push_str(&format!("game exited with status {status}\n"));
     }
     if driver_failed || game_failed {
@@ -178,6 +195,7 @@ fn spawn_command(
     label: &str,
     command: &[String],
     args: &RunArgs,
+    python: &BundledPythonClient,
     capture_dir: &Path,
     transcript_file: &Path,
     piped_logs: bool,
@@ -188,7 +206,8 @@ fn spawn_command(
         .env("BEVY_FEEDBACK_PROTOCOL", &args.protocol_file)
         .env("BEVY_FEEDBACK_CAPTURE_DIR", capture_dir)
         .env("BEVY_FEEDBACK_ARTIFACTS", &args.artifacts)
-        .env("BEVY_FEEDBACK_TRANSCRIPT", transcript_file);
+        .env("BEVY_FEEDBACK_TRANSCRIPT", transcript_file)
+        .env("PYTHONPATH", python.python_path());
     if piped_logs {
         child.stdout(Stdio::piped()).stderr(Stdio::piped());
     }

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 
 const PROTOCOL_VERSION = "bevy-agent-feedback/2";
+const DEFAULT_MAX_WAIT_FRAMES = 300;
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type JsonObject = { [key: string]: Json };
@@ -33,6 +34,7 @@ export class BevyFeedbackClient {
   private readonly ready: Promise<void>;
   private readonly timeoutMs: number;
   private readonly transcriptFile?: string;
+  private readonly maxWaitFrames: number;
   private buffer = "";
   private nextId = 1;
   private closed = false;
@@ -48,6 +50,10 @@ export class BevyFeedbackClient {
     this.transcriptFile = config.transcriptFile ?? process.env.BEVY_FEEDBACK_TRANSCRIPT;
 
     const protocol = readProtocol(protocolFile);
+    const maxWaitFrames = Number(protocol.max_wait_frames ?? DEFAULT_MAX_WAIT_FRAMES);
+    this.maxWaitFrames = Number.isFinite(maxWaitFrames)
+      ? Math.max(1, Math.trunc(maxWaitFrames))
+      : DEFAULT_MAX_WAIT_FRAMES;
     const { host, port } = parseSocketAddr(String(protocol.socket_addr));
     this.socket = net.createConnection({ host, port });
     this.socket.setEncoding("utf8");
@@ -108,8 +114,19 @@ export class BevyFeedbackClient {
     return responses;
   }
 
-  wait(frames = 1): Promise<JsonObject> {
-    return this.request({ command: "wait", frames });
+  async wait(frames = 1): Promise<JsonObject> {
+    const cap = Math.max(1, Math.trunc(this.maxWaitFrames));
+    if (frames <= cap) {
+      return this.request({ command: "wait", frames });
+    }
+    let response: JsonObject = {};
+    let remaining = frames;
+    while (remaining > 0) {
+      const step = Math.min(remaining, cap);
+      response = await this.request({ command: "wait", frames: step });
+      remaining -= step;
+    }
+    return response;
   }
 
   async capture(label?: string): Promise<string> {

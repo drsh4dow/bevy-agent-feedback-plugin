@@ -50,6 +50,123 @@ class BevyFeedbackClientCoordinateHelpersTest(unittest.TestCase):
             client.point(0.95, 0.5)
 
 
+class BevyFeedbackClientWaitTest(unittest.TestCase):
+    def test_wait_chunks_requests_above_server_frame_cap(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        client.max_wait_frames = 300
+        responses = [
+            {"ok": True, "result": {"step": 1}},
+            {"ok": True, "result": {"step": 2}},
+            {"ok": True, "result": {"step": 3}},
+        ]
+        client.request = mock.Mock(side_effect=responses)
+
+        response = client.wait(750)
+
+        self.assertEqual(response, responses[-1])
+        self.assertEqual(
+            [call.args[0]["frames"] for call in client.request.call_args_list],
+            [300, 300, 150],
+        )
+
+    def test_wait_under_frame_cap_uses_one_request(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        client.max_wait_frames = 300
+        response = {"ok": True, "result": {"frames": 10}}
+        client.request = mock.Mock(return_value=response)
+
+        self.assertEqual(client.wait(10), response)
+        client.request.assert_called_once_with({"command": "wait", "frames": 10})
+
+    def test_wait_zero_passthrough_preserves_server_rejection(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        client.max_wait_frames = 300
+        response = {"ok": True, "result": {"frames": 0}}
+        client.request = mock.Mock(return_value=response)
+
+        self.assertEqual(client.wait(0), response)
+        client.request.assert_called_once_with({"command": "wait", "frames": 0})
+
+
+class BevyFeedbackClientWaitUntilStableTest(unittest.TestCase):
+    def test_static_screen_returns_after_stable_polls(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        captures = [
+            Path("initial.png"),
+            Path("stable_1.png"),
+            Path("stable_2.png"),
+        ]
+        client.capture = mock.Mock(side_effect=captures)
+        client.wait = mock.Mock()
+
+        with mock.patch.object(bevy_feedback, "pixel_diff", return_value=0):
+            result = client.wait_until_stable(
+                frames=7, attempts=5, stable=2, label="boot"
+            )
+
+        self.assertEqual(result, captures[2])
+        self.assertEqual(client.wait.call_count, 2)
+
+    def test_change_resets_stable_streak(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        captures = [
+            Path("initial.png"),
+            Path("changed.png"),
+            Path("stable_1.png"),
+            Path("stable_2.png"),
+        ]
+        client.capture = mock.Mock(side_effect=captures)
+        client.wait = mock.Mock()
+
+        with mock.patch.object(bevy_feedback, "pixel_diff", side_effect=[1, 0, 0]):
+            result = client.wait_until_stable(frames=7, attempts=3, stable=2)
+
+        self.assertEqual(result, captures[3])
+        self.assertEqual(client.wait.call_count, 3)
+
+    def test_raises_after_attempts_without_stabilizing(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        client.capture = mock.Mock(
+            side_effect=[
+                Path("initial.png"),
+                Path("changed_1.png"),
+                Path("changed_2.png"),
+                Path("changed_3.png"),
+            ]
+        )
+        client.wait = mock.Mock()
+
+        with (
+            mock.patch.object(bevy_feedback, "pixel_diff", return_value=1),
+            self.assertRaisesRegex(BevyFeedbackError, "did not stabilize"),
+        ):
+            client.wait_until_stable(frames=7, attempts=3, stable=2)
+
+    def test_dimension_mismatch_is_treated_as_change(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        captures = [
+            Path("initial.png"),
+            Path("resized.png"),
+            Path("stable_1.png"),
+            Path("stable_2.png"),
+        ]
+        client.capture = mock.Mock(side_effect=captures)
+        client.wait = mock.Mock()
+
+        with mock.patch.object(
+            bevy_feedback,
+            "pixel_diff",
+            side_effect=[
+                BevyFeedbackError("image dimensions differ: 1x1 vs 2x2"),
+                0,
+                0,
+            ],
+        ):
+            result = client.wait_until_stable(frames=7, attempts=3, stable=2)
+
+        self.assertEqual(result, captures[3])
+
+
 class BevyFeedbackRunBoundaryTest(unittest.TestCase):
     def test_fail_raises_client_error_with_message(self) -> None:
         with self.assertRaisesRegex(BevyFeedbackError, "missing start button"):

@@ -586,6 +586,7 @@ pub(crate) fn write_protocol_file(
         "capture_dir": config.capture_dir.to_string_lossy(),
         "command_timeout_ms": config.command_timeout.as_millis(),
         "max_action_steps": config.max_action_steps,
+        "max_wait_frames": config.max_wait_frames,
         "commands": commands,
         "examples": examples,
     });

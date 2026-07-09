@@ -23,7 +23,7 @@ Read the JSON file at `$BEVY_FEEDBACK_PROTOCOL` (default
 | `session_id`, `pid`, `started_at_unix_ms` | session identity |
 | `heartbeat_file`, `heartbeat_interval_ms`, `stale_after_ms` | liveness |
 | `capture_dir` | where `capture` writes PNGs |
-| `command_timeout_ms`, `max_action_steps` | limits (see below) |
+| `command_timeout_ms`, `max_action_steps`, `max_wait_frames` | limits (see below) |
 | `coordinates` | `logical window pixels, origin top-left` |
 | `commands`, `examples` | live command schema + sample requests |
 
@@ -73,7 +73,7 @@ frames. Held input (`key_down`, `mouse_down`) persists until released or
 |---|---|---|
 | `key_down` / `key_up` | `key` | physical `KeyCode` name (below), case-insensitive |
 | `mouse_down` / `mouse_up` | `button` | `MouseButton` name, case-insensitive |
-| `cursor_move` | `x`, `y` | synthesize Bevy cursor movement to an agent logical position |
+| `cursor_move` | `x`, `y` | synthesize Bevy cursor movement to an agent logical position; also updates `Window::cursor_position`, so idiomatic `window.cursor_position()` game code sees agent input |
 | `mouse_motion` | `dx`, `dy` | raw motion delta |
 | `mouse_scroll` | `y`, `x?`=0, `unit?` | `unit`: `Line` (default) or `Pixel` |
 | `text` | `value` | UTF-8 committed via Bevy IME |
@@ -84,8 +84,8 @@ frames. Held input (`key_down`, `mouse_down`) persists until released or
 
 | command | params | notes |
 |---|---|---|
-| `click` | `x`, `y`, `button?`=Left, `frames?`=1 | press+release over `frames` |
-| `drag` | `from`=[x,y], `to`=[x,y], `button?`=Left, `steps?`=10, `frames?`=steps | `frames` ≥ `steps`; `steps` ≤ `max_action_steps` |
+| `click` | `x`, `y`, `button?`=Left, `frames?`=1 | press+release over `frames`; also updates `Window::cursor_position` |
+| `drag` | `from`=[x,y], `to`=[x,y], `button?`=Left, `steps?`=10, `frames?`=steps | `frames` ≥ `steps`; `steps` ≤ `max_action_steps`; each move updates `Window::cursor_position` |
 | `scroll` | `lines`, `x?`=0, `unit?` | vertical line delta (wraps `mouse_scroll`) |
 | `key_tap` | `key`, `frames?`=1 | hold for `frames` then release |
 | `key_hold` | `key`, `frames?`=1 | hold for `frames` then release |
@@ -96,7 +96,7 @@ frames. Held input (`key_down`, `mouse_down`) persists until released or
 | command | params | result |
 |---|---|---|
 | `window_info` | — | window + snapshot |
-| `wait` | `frames?`=1 | advance `frames` (1..=`max_wait_frames`) |
+| `wait` | `frames?`=1 | advance `frames` (1..=`max_wait_frames`); bundled clients chunk larger waits automatically |
 | `capture` | `label?` `[A-Za-z0-9_-]{1,40}` | write PNG; `capture.path`; filename includes `-label` when present |
 | `shutdown` | — | exit the app cleanly |
 
@@ -145,4 +145,4 @@ retained captures 32 (older PNGs pruned).
 
 An invalid name returns `invalid_request` with a "did you mean" suggestion.
 
-On Wayland, cursor commands do not require OS cursor warping; the plugin writes Bevy cursor events and reports the agent logical cursor in `mouse_position`.
+On Wayland, cursor commands do not require OS cursor warping; synthetic cursor state is written directly into the Bevy `Window` component and reported in `mouse_position`. If the game itself mutates the window that frame, one OS warp attempt may occur (a single logged error on Wayland).

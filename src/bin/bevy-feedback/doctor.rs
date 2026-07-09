@@ -1,4 +1,4 @@
-use crate::args;
+use crate::{args, python_client::BundledPythonClient};
 use bevy_agent_feedback_plugin::client::AgentClient;
 use std::{
     env,
@@ -118,12 +118,29 @@ fn check_python_version() -> bool {
 }
 
 fn check_python_import() -> bool {
-    match Command::new("python3")
+    let dir = env::temp_dir().join(format!("bevy-feedback-doctor-{}", std::process::id()));
+    let client = match BundledPythonClient::materialize(&dir) {
+        Ok(client) => client,
+        Err(error) => {
+            emit(
+                "fail",
+                format!("cannot materialize bundled client: {error}"),
+            );
+            return false;
+        }
+    };
+    let output = Command::new("python3")
         .args(["-c", "import bevy_feedback"])
-        .output()
-    {
+        .env("PYTHONPATH", client.python_path())
+        .output();
+    client.remove();
+
+    match output {
         Ok(output) if output.status.success() => {
-            emit("ok", "python import bevy_feedback works".to_string());
+            emit(
+                "ok",
+                "python import bevy_feedback works (bundled client)".to_string(),
+            );
             true
         }
         Ok(output) => {
@@ -131,7 +148,7 @@ fn check_python_import() -> bool {
             emit(
                 "fail",
                 format!(
-                    "python import bevy_feedback failed: {output_text}; set PYTHONPATH to the directory containing bevy_feedback.py (e.g. .agents/skills/driving-bevy-games)"
+                    "python import bevy_feedback failed: {output_text}; bevy-feedback run injects the bundled client automatically; this failure means python3 cannot import it even with PYTHONPATH set"
                 ),
             );
             false
@@ -140,7 +157,7 @@ fn check_python_import() -> bool {
             emit(
                 "fail",
                 format!(
-                    "python3 import check failed: {error}; set PYTHONPATH to the directory containing bevy_feedback.py (e.g. .agents/skills/driving-bevy-games)"
+                    "python3 import check failed: {error}; bevy-feedback run injects the bundled client automatically; this failure means python3 cannot import it even with PYTHONPATH set"
                 ),
             );
             false

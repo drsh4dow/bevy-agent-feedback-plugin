@@ -278,10 +278,13 @@ pub(super) fn move_cursor_internal(
     state: &mut AgentFeedbackState,
     position: Vec2,
 ) -> Result<WindowInfo, CommandError> {
-    let Ok((window_entity, window)) = windows.single_mut() else {
+    let Ok((window_entity, mut window)) = windows.single_mut() else {
         return Err(CommandError::MissingWindow);
     };
     validate_position(&window, position)?;
+    window
+        .bypass_change_detection()
+        .set_cursor_position(Some(position));
 
     let previous = state.cursor_position.or_else(|| window.cursor_position());
     state.cursor_position = Some(position);
@@ -394,6 +397,11 @@ pub(super) fn capture_primary_window(
     responder: SyncSender<AgentResponse>,
     label: Option<String>,
 ) -> bool {
+    if windows.single_mut().is_err() {
+        let _ = responder.send(error_response(id, CommandError::MissingWindow));
+        return false;
+    }
+
     if let Err(error) = fs::create_dir_all(&config.capture_dir) {
         let _ = responder.send(AgentResponse::error(
             id,

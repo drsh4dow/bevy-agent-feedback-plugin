@@ -129,6 +129,7 @@ fn writes_v2_protocol_with_session_metadata() {
         serde_json::from_slice(&fs::read(&config.protocol_file).unwrap()).expect("protocol json");
     assert_eq!(protocol["protocol"], PROTOCOL_VERSION);
     assert_eq!(protocol["session_id"], session.session_id);
+    assert_eq!(protocol["max_wait_frames"], config.max_wait_frames);
     assert!(session.heartbeat_file.exists());
     let _ = fs::remove_dir_all(root);
 }
