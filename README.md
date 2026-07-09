@@ -1,142 +1,91 @@
 # bevy-agent-feedback-plugin
 
-Local agent feedback for Bevy apps.
+Local, bounded agent input, semantic diagnostics, deterministic Bevy time, and completion-confirmed PNG feedback for Bevy 0.19 apps over a v2 JSON-lines TCP protocol.
 
-This crate lets Pi/Codex drive a running Bevy app through a v2 JSON-lines TCP protocol. Agents can press keys, move/click/drag/scroll the mouse, submit text/file-drop events, query window metadata, wait for frames, capture labeled PNG screenshots, replay transcripts, and shut the app down cleanly.
-
-## Install
-
-```sh
-cargo add bevy-agent-feedback-plugin --optional
-```
-
-Manual `Cargo.toml` form uses the `0.3` line:
+## Install and wire
 
 ```toml
-bevy-agent-feedback-plugin = { version = "0.3", optional = true }
-```
+[dependencies]
+bevy-agent-feedback-plugin = { version = "0.4", optional = true, features = ["diagnostics"] }
 
-```toml
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
 ```
 
-```rust
-#[cfg(feature = "agent")]
-app.add_plugins(bevy_agent_feedback_plugin::AgentFeedbackPlugin::new(
-    bevy_agent_feedback_plugin::AgentFeedbackConfig {
-        bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
-            .map(Into::into)
-            .unwrap_or_else(|| "target/agent-feedback/agent-feedback.json".into()),
-        capture_dir: std::env::var_os("BEVY_FEEDBACK_CAPTURE_DIR")
-            .map(Into::into)
-            .unwrap_or_else(|| "target/agent-feedback/captures".into()),
-        ..Default::default()
-    },
-));
-```
-
-Install the wrapper binary (`bevy-feedback`):
-
-```sh
-cargo install bevy-agent-feedback-plugin
-bevy-feedback --version
-bevy-feedback doctor
-```
-
-Dev form from this repo:
-
-```sh
-cargo run --bin bevy-feedback -- run -- cargo run --example minimal
-```
-
-## Quick Start
+Add feedback after `DefaultPlugins` (or after the plugins providing Bevy time, window, render, and input resources):
 
 ```rust
 use bevy::prelude::*;
-use bevy_agent_feedback_plugin::{AgentFeedbackConfig, AgentFeedbackPlugin};
+use bevy_agent_feedback_plugin::{
+    AgentFeedbackConfig, AgentFeedbackDiagnosticsPlugin, AgentFeedbackPlugin,
+};
 use std::{net::SocketAddr, path::PathBuf};
 
-fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins)
-        .add_plugins(AgentFeedbackPlugin::new(AgentFeedbackConfig {
-            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            protocol_file: PathBuf::from("target/agent-feedback/agent-feedback.json"),
-            capture_dir: PathBuf::from("target/agent-feedback/captures"),
-            ..Default::default()
-        }))
-        .run();
-}
+App::new()
+    .add_plugins(DefaultPlugins)
+    .add_plugins(AgentFeedbackPlugin::new(AgentFeedbackConfig {
+        bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        protocol_file: PathBuf::from("target/agent-feedback/agent-feedback.json"),
+        capture_dir: PathBuf::from("target/agent-feedback/captures"),
+        deterministic_time: true,
+        ..Default::default()
+    }))
+    .add_plugins(
+        AgentFeedbackDiagnosticsPlugin::default()
+            .with_state::<AppState>()
+            .with_marker::<Clickable>()
+            .with_resource_field::<RoundStats, _, _>("score", |stats| stats.score),
+    )
+    .run();
 ```
 
-Use port `0` for examples and tests. The plugin writes a self-describing protocol file with the chosen socket, session heartbeat, capture directory, commands, and examples.
+The optional `diagnostics` feature enables Bevy state/UI support and registered state, resource-field, marker, predicate, semantic-target, and atomic named-click commands. Port `0` lets the OS choose a free local port. The generated protocol file advertises the chosen socket, heartbeat, capture directory, supported commands, deterministic mode, and live caps.
 
-For deterministic captures, pin the window size and scale factor:
+Deterministic mode freezes Bevy-managed virtual/fixed time between `advance_time` requests. It cannot control direct `Instant::now()`, OS/network clocks, unseeded RNG, or other external state. Pinning `WindowResolution` and scale factor helps reproduce PNG dimensions, but remains subject to the display/window manager.
 
-```rust
-Window {
-    resolution: bevy::window::WindowResolution::new(1280, 720)
-        .with_scale_factor_override(1.0),
-    ..default()
-}
-```
-
-## Drive it
-
-Manual wrapper:
+## Run and drive
 
 ```sh
-cargo run --bin bevy-feedback -- run -- cargo run --example minimal
-```
+cargo install bevy-agent-feedback-plugin
+bevy-feedback doctor
 
-Recommended automated mode:
-
-```sh
-cargo run --bin bevy-feedback -- run --ready-timeout 180000 \
-  --game cargo run --example minimal \
+bevy-feedback run --ready-timeout 180000 \
+  --game cargo run --features agent \
   --driver python3 my_driver.py
 ```
 
-The wrapper exports the protocol/capture/artifact paths, waits for protocol readiness, streams logs, releases inputs, sends `shutdown`, copies PNGs from the protocol file's `capture_dir` into `artifacts/screenshots/`, and prints those screenshot paths on success. Protocol ready means the automation socket exists; wait for a stable game frame in the driver before capturing. Timeout flags use milliseconds and can also come from environment variables:
+Protocol readiness only means the socket exists; it does not prove the game is ready. For animated games, wait on a registered semantic state/resource/marker/target predicate, then use `capture_after_frames(1)`. For genuinely static content, strict region-scoped `wait_until_stable` is available. See the canonical [`driving-bevy-games` skill](skills/driving-bevy-games/SKILL.md) for the readiness/time decision, exact setup, input defaults, and physical-PNG-pixel mask fallback.
 
-| flag | env | default |
-|---|---|---|
-| `--ready-timeout MS` | `BEVY_FEEDBACK_READY_TIMEOUT_MS` | `60000` |
-| `--driver-timeout MS` | `BEVY_FEEDBACK_DRIVER_TIMEOUT_MS` | `300000` |
-| `--shutdown-timeout MS` | `BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS` | `5000` |
+Public clients use:
 
-Artifacts from `bevy-feedback run`:
+- `wait_frames`: app-update progress, not gameplay elapsed time.
+- `wait_seconds`: observational normal-time wait; frozen deterministic mode rejects it.
+- `advance_time`: deterministic gameplay progression, chunked only from advertised caps.
+- `wait_until_first_capture` and `capture_after_frames`: screenshot-readback-completed PNGs.
+- registered predicate waits and atomic `click_named`/accessibility-label/marker clicks.
 
-| path | purpose |
-|---|---|
-| `game.log` | game stdout/stderr |
-| `driver.log` | driver stdout/stderr |
-| `protocol.json` | copied protocol/session metadata |
-| `transcript.jsonl` | replayable request/response/timing envelopes |
-| `captures/` | wrapper-exported fallback live capture dir |
-| `screenshots/` | final copied PNGs from the protocol `capture_dir` |
-| `failure-summary.txt` | failure reason, log tail, newest capture |
+Capture metadata includes sequence/path/label, request and completion app-update frames, PNG dimensions, request/completion window metadata, and `completion: "screenshot_captured"`. This proves Bevy screenshot readback and PNG persistence, not OS/window-compositor presentation.
 
-`--game ... --driver ...` is the best mode for automation because the driver receives `BEVY_FEEDBACK_TRANSCRIPT`, so client commands are recorded in `transcript.jsonl`.
-
-Raw JSON-lines also works:
+Raw v2 JSON-lines retains the compatibility wire command `"wait"`:
 
 ```jsonl
-{"id":1,"command":"window_info"}
-{"id":2,"command":"click","x":320,"y":240,"button":"left"}
-{"id":3,"command":"key_hold","key":"KeyW","frames":30}
-{"id":4,"command":"capture","label":"default"}
+{"id":1,"command":"wait","frames":1}
+{"id":2,"command":"wait_seconds","seconds":0.5,"max_frames":300}
+{"id":3,"command":"advance_time","seconds":1.0,"step_seconds":0.016666667}
+{"id":4,"command":"wait_for","predicate":{"type":"state_equals","state":"AppState","value":"Playing"},"max_frames":300}
+{"id":5,"command":"click_target","target":{"name":"Play"}}
+{"id":6,"command":"capture_after_frames","frames":1,"label":"playing"}
 ```
+
+Input coordinates are logical primary-window pixels. PNG crop/include/mask rectangles are physical image pixels; use capture dimensions and scale factor, and recompute after resize.
 
 ## Clients
 
-Rust: `bevy_agent_feedback_plugin::client::AgentClient`, including `capture_labeled("name")`.
-Python: `clients/python/bevy_feedback.py`; wrap drivers in `bevy_feedback.run(main)` and use `fail("message")` for expected game/client failures without tracebacks. `capture(label="name")` names PNGs.
-TypeScript: `clients/typescript/bevy_feedback.ts`, dependency-free (`node` with type stripping or `tsx`), with `capture(label?)`.
+- Rust: `bevy_agent_feedback_plugin::client::AgentClient`.
+- Python canonical source: `clients/python/bevy_feedback.py`; `bevy-feedback run` injects its byte-identical skill bundle. Use `import bevy_feedback`, `bevy_feedback.run(main)`, and `fail(...)`.
+- TypeScript: `clients/typescript/bevy_feedback.ts`, dependency-free with Node type stripping or `tsx`.
 
-Rust/Python clients include pixel/OCR assertions. TypeScript covers core driving only. All clients can replay transcript envelopes (`request` + `response` + timing) and older request-only JSONL, and release held inputs on close. See [`skills/driving-bevy-games/SKILL.md`](skills/driving-bevy-games/SKILL.md) for the first-use workflow.
+All clients preserve additive protocol-v2 response fields, replay request-only or transcript-envelope JSONL, retain structured error context/latest capture metadata, and release held inputs on close.
 
 ```ts
 import { BevyFeedbackClient } from "./clients/typescript/bevy_feedback.ts";
@@ -146,20 +95,8 @@ console.log(await game.windowInfo());
 await game.close();
 ```
 
-## Optional diagnostics
+## Artifacts and CI
 
-Enable the `diagnostics` feature and add `AgentFeedbackDiagnosticsPlugin` for `ecs_summary`, `list_entities`, `camera_info`, registered `state_info`, and registered marker-component `marker_info` commands.
+`bevy-feedback run` streams logs, records `transcript.jsonl`, releases inputs, sends `shutdown`, and copies protocol `capture_dir` PNGs to `artifacts/screenshots/`. `failure-summary.txt` includes bounded server diagnostic context, log tails, and the newest capture when available.
 
-```rust
-#[derive(Component)]
-struct Selectable;
-
-app.add_plugins(
-    bevy_agent_feedback_plugin::AgentFeedbackDiagnosticsPlugin::default()
-        .with_marker::<Selectable>(),
-);
-```
-
-## CI
-
-See [`docs/ci-linux.md`](docs/ci-linux.md) for the headless `xvfb-run` recipe and artifact upload path. Windowed captures need a display (`DISPLAY`, `WAYLAND_DISPLAY`, or `xvfb-run`).
+See [`docs/ci-linux.md`](docs/ci-linux.md) for `xvfb-run` and artifact upload. Windowed screenshot readback requires a usable display and is subject to window/compositor constraints.

@@ -1,6 +1,8 @@
 use crate::{
     config::AgentFeedbackConfig,
-    protocol::{AgentCommand, AgentResponse, parse_request, write_protocol_file},
+    protocol::{
+        AgentCommand, AgentResponse, ParseLimits, parse_request_with_limits, write_protocol_file,
+    },
     session::AgentFeedbackSession,
 };
 use bevy::{app::AppExit, prelude::*};
@@ -71,12 +73,15 @@ pub(crate) struct AgentRequest {
     pub(crate) id: Value,
     pub(crate) command: AgentCommand,
     pub(crate) responder: SyncSender<AgentResponse>,
+    pub(crate) canceled: Arc<AtomicBool>,
 }
 
 struct ServerSettings {
     command_timeout: Duration,
     max_wait_frames: u16,
     max_action_steps: u16,
+    max_time_advance_steps: u16,
+    max_time_advance: Duration,
     release_on_disconnect: Arc<AtomicBool>,
 }
 
@@ -120,6 +125,8 @@ fn start_runtime(
         command_timeout: config.command_timeout,
         max_wait_frames: config.max_wait_frames,
         max_action_steps: config.max_action_steps,
+        max_time_advance_steps: config.max_time_advance_steps,
+        max_time_advance: config.max_time_advance,
         release_on_disconnect: release_on_disconnect.clone(),
     };
     let thread = thread::Builder::new()
@@ -232,7 +239,15 @@ fn handle_line(
     sender: &SyncSender<AgentRequest>,
     settings: &ServerSettings,
 ) -> io::Result<()> {
-    let request = match parse_request(line, settings.max_wait_frames, settings.max_action_steps) {
+    let request = match parse_request_with_limits(
+        line,
+        ParseLimits {
+            max_wait_frames: settings.max_wait_frames,
+            max_action_steps: settings.max_action_steps,
+            max_time_advance_steps: settings.max_time_advance_steps,
+            max_time_advance: settings.max_time_advance,
+        },
+    ) {
         Ok(request) => request,
         Err(error) => {
             return write_response(
@@ -244,14 +259,22 @@ fn handle_line(
 
     let id = request.id.clone();
     let (response_sender, response_receiver) = sync_channel(1);
+    let canceled = Arc::new(AtomicBool::new(false));
     let agent_request = AgentRequest {
         id: request.id,
         command: request.command,
         responder: response_sender,
+        canceled: canceled.clone(),
     };
 
     match sender.try_send(agent_request) {
-        Ok(()) => wait_for_response(stream, response_receiver, id, settings.command_timeout),
+        Ok(()) => wait_for_response(
+            stream,
+            response_receiver,
+            id,
+            settings.command_timeout,
+            &canceled,
+        ),
         Err(TrySendError::Full(request)) => write_response(
             stream,
             &AgentResponse::error(request.id, "queue_full", "game command queue is full"),
@@ -268,6 +291,7 @@ fn wait_for_response(
     response_receiver: Receiver<AgentResponse>,
     id: Value,
     command_timeout: Duration,
+    canceled: &AtomicBool,
 ) -> io::Result<()> {
     let start = Instant::now();
     while start.elapsed() < command_timeout {
@@ -275,6 +299,7 @@ fn wait_for_response(
             Ok(response) => return write_response(stream, &response),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if socket_closed(stream) {
+                    canceled.store(true, Ordering::Release);
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "client disconnected while command was pending",
@@ -286,6 +311,7 @@ fn wait_for_response(
             }
         }
     }
+    canceled.store(true, Ordering::Release);
     write_response(
         stream,
         &AgentResponse::error(

@@ -33,7 +33,17 @@ pub(super) fn run_pending_action(
                 state,
             ) {
                 Ok(info) => {
-                    ok_with_window(action.responder.clone(), action.id.clone(), state, info)
+                    if let Some(details) = action.details.take() {
+                        let _ = action.responder.send(AgentResponse::details_with_context(
+                            action.id.clone(),
+                            "clicked_target",
+                            state.latest_capture.clone(),
+                            snapshot(state, Some(info)),
+                            details,
+                        ));
+                    } else {
+                        ok_with_window(action.responder.clone(), action.id.clone(), state, info);
+                    }
                 }
                 Err(()) => missing_window(action.responder.clone(), action.id.clone()),
             }
@@ -162,7 +172,7 @@ pub(super) fn error_response(id: Value, error: CommandError) -> AgentResponse {
     }
 }
 
-fn snapshot(state: &AgentFeedbackState, window: Option<WindowInfo>) -> AgentSnapshot {
+pub(super) fn snapshot(state: &AgentFeedbackState, window: Option<WindowInfo>) -> AgentSnapshot {
     let mouse_position = state
         .cursor_position
         .map(|position| [position.x, position.y]);
@@ -386,78 +396,4 @@ fn contains_position(window: &Window, position: Vec2) -> bool {
         && position.y >= 0.0
         && position.x < window.width()
         && position.y < window.height()
-}
-
-pub(super) fn capture_primary_window(
-    commands: &mut Commands,
-    config: &AgentFeedbackConfig,
-    state: &mut AgentFeedbackState,
-    windows: &mut Query<(Entity, &mut Window), With<PrimaryWindow>>,
-    id: Value,
-    responder: SyncSender<AgentResponse>,
-    label: Option<String>,
-) -> bool {
-    if windows.single_mut().is_err() {
-        let _ = responder.send(error_response(id, CommandError::MissingWindow));
-        return false;
-    }
-
-    if let Err(error) = fs::create_dir_all(&config.capture_dir) {
-        let _ = responder.send(AgentResponse::error(
-            id,
-            "capture_dir",
-            format!("failed to create capture directory: {error}"),
-        ));
-        return false;
-    }
-
-    let window = primary_window_info(windows).ok().map(|(_, info)| info);
-    let snapshot = Some(snapshot(state, window));
-    let sequence = state.next_capture;
-    state.next_capture += 1;
-    let filename = match &label {
-        Some(label) => format!("capture-{sequence:06}-{label}.png"),
-        None => format!("capture-{sequence:06}.png"),
-    };
-    let path = config.capture_dir.join(filename);
-    let capture = CaptureInfo {
-        sequence,
-        path: path.to_string_lossy().into_owned(),
-        label,
-    };
-    let max_captures = config.max_captures.max(1);
-
-    commands.spawn(Screenshot::primary_window()).observe(
-        move |screenshot: On<ScreenshotCaptured>, mut state: ResMut<AgentFeedbackState>| {
-            let response = match save_capture(&screenshot.image, &path) {
-                Ok(()) => {
-                    state.latest_capture = Some(capture.clone());
-                    state.captures.push_back(path.clone());
-                    while state.captures.len() > max_captures {
-                        if let Some(old_capture) = state.captures.pop_front() {
-                            let _ = fs::remove_file(old_capture);
-                        }
-                    }
-                    AgentResponse::captured(id.clone(), capture.clone(), snapshot.clone())
-                }
-                Err(error) => AgentResponse::error(
-                    id.clone(),
-                    "capture_failed",
-                    format!("failed to save capture: {error}"),
-                ),
-            };
-            let _ = responder.send(response);
-        },
-    );
-    true
-}
-
-fn save_capture(image: &bevy::image::Image, path: &Path) -> io::Result<()> {
-    let rgb = image
-        .clone()
-        .try_into_dynamic()
-        .map_err(io::Error::other)?
-        .to_rgb8();
-    rgb.save_with_format(path, image::ImageFormat::Png)
-        .map_err(io::Error::other)
 }

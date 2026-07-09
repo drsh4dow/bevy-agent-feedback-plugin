@@ -29,6 +29,23 @@ pub struct AgentFeedbackConfig {
     /// Maximum accepted step count for compound actions such as `drag`.
     pub max_action_steps: u16,
 
+    /// Freezes Bevy virtual time between explicit advancement commands.
+    ///
+    /// The default is `false`, which preserves Bevy's normal time behavior.
+    pub deterministic_time: bool,
+
+    /// Maximum number of deterministic deltas in one `advance_time` command.
+    ///
+    /// This cap is always treated as at least one by protocol discovery and
+    /// request validation. The default is `600`.
+    pub max_time_advance_steps: u16,
+
+    /// Maximum gameplay duration accepted by one `advance_time` command.
+    ///
+    /// The default is 10 seconds. Wire durations must also be finite, positive,
+    /// and nonzero after conversion to [`Duration`].
+    pub max_time_advance: Duration,
+
     /// How often the plugin refreshes the session heartbeat file.
     pub heartbeat_interval: Duration,
 
@@ -57,6 +74,9 @@ impl Default for AgentFeedbackConfig {
             max_pending_commands: 32,
             max_wait_frames: 300,
             max_action_steps: 120,
+            deterministic_time: false,
+            max_time_advance_steps: 600,
+            max_time_advance: Duration::from_secs(10),
             heartbeat_interval: Duration::from_millis(250),
             session_stale_after: Duration::from_secs(3),
             max_captures: 32,

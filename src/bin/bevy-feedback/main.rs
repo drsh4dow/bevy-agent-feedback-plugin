@@ -19,6 +19,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+const DIAGNOSTIC_BLOCK_MAX_BYTES: usize = 8 * 1024;
+const TRANSCRIPT_READ_CHUNK_BYTES: usize = 8 * 1024;
+const TRANSCRIPT_LINE_MAX_BYTES: usize = 64 * 1024;
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
@@ -92,12 +96,13 @@ fn run(args: RunArgs) -> Result<(), String> {
                 &game_log,
                 None,
                 &wrapper_capture_dir,
+                &transcript_file,
                 format!("{error}\n"),
             );
         }
     };
     println!(
-        "bevy-feedback ready: session={} socket={} protocol={} (protocol ready != game ready; wait for a stable frame before capturing)",
+        "bevy-feedback ready: session={} socket={} protocol={} (protocol ready != game ready; use semantic readiness for animated games or strict stability for static scenes before capturing)",
         ready.session_id,
         ready.socket_addr,
         args.protocol_file.display()
@@ -183,6 +188,7 @@ fn run(args: RunArgs) -> Result<(), String> {
             &game_log,
             driver_log.as_deref(),
             &live_capture_dir,
+            &transcript_file,
             failure_summary,
         );
     }
@@ -343,9 +349,16 @@ fn fail_run(
     game_log: &Path,
     driver_log: Option<&Path>,
     capture_dir: &Path,
+    transcript_file: &Path,
     mut failure_summary: String,
 ) -> Result<(), String> {
-    append_failure_context(&mut failure_summary, game_log, driver_log, capture_dir);
+    append_failure_context(
+        &mut failure_summary,
+        game_log,
+        driver_log,
+        capture_dir,
+        transcript_file,
+    );
     fs::write(artifacts.join("failure-summary.txt"), &failure_summary)
         .map_err(|error| error.to_string())?;
     Err(format!(
@@ -360,6 +373,7 @@ fn append_failure_context(
     game_log: &Path,
     driver_log: Option<&Path>,
     capture_dir: &Path,
+    transcript_file: &Path,
 ) {
     failure_summary.push_str(&format!("game log: {}\n", game_log.display()));
     if let Some(driver_log) = driver_log {
@@ -382,6 +396,127 @@ fn append_failure_context(
         failure_summary.push_str("last 20 driver.log lines:\n");
         failure_summary.push_str(&lines);
         failure_summary.push('\n');
+    }
+    append_transcript_context(failure_summary, transcript_file);
+}
+
+fn append_transcript_context(failure_summary: &mut String, transcript_file: &Path) {
+    let Ok(Some(context)) = transcript_diagnostic_context(transcript_file) else {
+        failure_summary.push_str("diagnostic context unavailable\n");
+        return;
+    };
+    let Ok(json) = serde_json::to_string(&context) else {
+        failure_summary.push_str("diagnostic context unavailable\n");
+        return;
+    };
+    const HEADER: &str = "diagnostic context:\n";
+    let payload_limit = DIAGNOSTIC_BLOCK_MAX_BYTES.saturating_sub(HEADER.len() + 1);
+    let rendered = if json.len() <= payload_limit {
+        json
+    } else {
+        let empty_wrapper = serde_json::json!({"truncated": true, "context_json_prefix": ""});
+        let Ok(empty_wrapper_json) = serde_json::to_string(&empty_wrapper) else {
+            failure_summary.push_str("diagnostic context unavailable\n");
+            return;
+        };
+        let prefix_limit = payload_limit.saturating_sub(empty_wrapper_json.len()) / "\\u0000".len();
+        let prefix_boundary = json.floor_char_boundary(json.len().min(prefix_limit));
+        let wrapper = serde_json::json!({
+            "truncated": true,
+            "context_json_prefix": &json[..prefix_boundary],
+        });
+        let Ok(wrapper_json) = serde_json::to_string(&wrapper) else {
+            failure_summary.push_str("diagnostic context unavailable\n");
+            return;
+        };
+        wrapper_json
+    };
+    failure_summary.push_str(HEADER);
+    failure_summary.push_str(&rendered);
+    failure_summary.push('\n');
+}
+
+fn transcript_diagnostic_context(path: &Path) -> io::Result<Option<Value>> {
+    let mut file = File::open(path)?;
+    let mut chunk = [0_u8; TRANSCRIPT_READ_CHUNK_BYTES];
+    let mut line = Vec::with_capacity(TRANSCRIPT_READ_CHUNK_BYTES);
+    let mut discarding_oversized_line = false;
+    let mut last_error_context = None;
+    let mut last_diagnostic_details = None;
+
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        for &byte in &chunk[..count] {
+            if byte == b'\n' {
+                if !discarding_oversized_line {
+                    remember_transcript_context(
+                        &line,
+                        &mut last_error_context,
+                        &mut last_diagnostic_details,
+                    );
+                }
+                line.clear();
+                discarding_oversized_line = false;
+            } else if !discarding_oversized_line {
+                if line.len() < TRANSCRIPT_LINE_MAX_BYTES {
+                    line.push(byte);
+                } else {
+                    line.clear();
+                    discarding_oversized_line = true;
+                }
+            }
+        }
+    }
+
+    Ok(last_error_context.or(last_diagnostic_details))
+}
+
+fn remember_transcript_context(
+    line: &[u8],
+    last_error_context: &mut Option<Value>,
+    last_diagnostic_details: &mut Option<Value>,
+) {
+    let Ok(envelope) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    let Some(response) = envelope.get("response") else {
+        return;
+    };
+    if let Some(context) = response.pointer("/error/context")
+        && !context.is_null()
+    {
+        *last_error_context = Some(context.clone());
+        return;
+    }
+    let Some(status) = response.pointer("/result/status").and_then(Value::as_str) else {
+        return;
+    };
+    let diagnostic_status = matches!(
+        status,
+        "target_info"
+            | "clicked_target"
+            | "resource_info"
+            | "predicate_evaluated"
+            | "predicate_matched"
+    );
+    let diagnostic_request = status == "ok"
+        && envelope
+            .pointer("/request/command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| {
+                matches!(
+                    command,
+                    "ecs_summary" | "list_entities" | "camera_info" | "state_info" | "marker_info"
+                )
+            });
+    if (diagnostic_status || diagnostic_request)
+        && let Some(details) = response.pointer("/result/details")
+        && !details.is_null()
+    {
+        *last_diagnostic_details = Some(details.clone());
     }
 }
 
@@ -466,48 +601,4 @@ fn print_screenshots(paths: &[PathBuf]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawn_error_hints_when_executable_contains_whitespace() {
-        let error = spawn_error(
-            "--game",
-            &["cargo run --features agent".into()],
-            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
-        );
-
-        assert!(
-            error.contains("spawn --game [\"cargo run --features agent\"]: missing"),
-            "{error}"
-        );
-        assert!(error.contains("pass each argv word separately"), "{error}");
-    }
-
-    #[test]
-    fn copies_only_png_captures_sorted() {
-        let root = std::env::temp_dir().join(format!(
-            "bevy-feedback-copy-captures-{}",
-            std::process::id()
-        ));
-        let from = root.join("from");
-        let to = root.join("to");
-        fs::create_dir_all(&from).expect("from dir");
-        fs::write(from.join("capture-000002-b.png"), b"b").expect("capture b");
-        fs::write(from.join("capture-000001-a.png"), b"a").expect("capture a");
-        fs::write(from.join("notes.txt"), b"skip").expect("notes");
-
-        let copied = copy_captures(&from, &to).expect("copy captures");
-
-        assert_eq!(
-            copied,
-            vec![
-                to.join("capture-000001-a.png"),
-                to.join("capture-000002-b.png")
-            ]
-        );
-        assert_eq!(fs::read(to.join("capture-000001-a.png")).expect("a"), b"a");
-        assert!(!to.join("notes.txt").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-}
+mod tests;

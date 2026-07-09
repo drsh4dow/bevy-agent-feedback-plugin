@@ -67,7 +67,9 @@ examples:
   bevy-feedback run --ready-timeout 180000 --game cargo run --features agent --driver python3 tests/drive_camera.py
 
 note:
-  Protocol ready means the automation socket exists, not that assets are loaded. Wait for a stable frame before capturing.
+  Protocol-ready is not game-ready; use skills/driving-bevy-games/SKILL.md to choose readiness and time control.
+  Frame waits count app updates, not gameplay time. For animated games use predicates; use deterministic advance for gameplay time.
+  Capture completion proves screenshot readback, not OS compositor presentation.
   Do not quote the whole game or driver command; pass each argv word separately."
         .to_string()
 }
@@ -595,5 +597,30 @@ mod tests {
         assert!(usage.contains("doctor"));
         assert!(usage.contains("--version"));
         assert!(usage.contains("screenshots"));
+    }
+    #[test]
+    fn usage_points_to_readiness_time_and_capture_completion_guidance() {
+        let usage = usage();
+
+        assert!(
+            usage.contains(
+                "Protocol-ready is not game-ready; use skills/driving-bevy-games/SKILL.md to choose readiness and time control."
+            ),
+            "{usage}"
+        );
+        assert!(
+            usage.contains("Frame waits count app updates, not gameplay time."),
+            "{usage}"
+        );
+        assert!(
+            usage.contains(
+                "For animated games use predicates; use deterministic advance for gameplay time."
+            ),
+            "{usage}"
+        );
+        assert!(
+            usage.contains("Capture completion proves screenshot readback"),
+            "{usage}"
+        );
     }
 }

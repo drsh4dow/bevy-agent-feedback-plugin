@@ -5,15 +5,170 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from typing import Any, Callable
+from unittest import mock
 
 CLIENTS_PYTHON = Path(__file__).resolve().parents[1] / "clients" / "python"
 sys.path.insert(0, str(CLIENTS_PYTHON))
 
 import bevy_feedback
 from bevy_feedback import BevyFeedbackClient, BevyFeedbackError, fail, run
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class RecordingTransport:
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.responses = list(responses)
+        self.requests: list[dict[str, Any]] = []
+
+    def __call__(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append(request)
+        index = len(self.requests) - 1
+        if index >= len(self.responses):
+            raise AssertionError(f"unexpected request: {request}")
+        return self.responses[index]
+
+
+class JsonLineStream:
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.responses = list(responses)
+        self.next_response = 0
+        self.requests: list[dict[str, Any]] = []
+
+    def write(self, line: str) -> int:
+        self.requests.append(json.loads(line))
+        return len(line)
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> str:
+        if self.next_response >= len(self.responses):
+            return ""
+        response = self.responses[self.next_response]
+        self.next_response += 1
+        return json.dumps(response, separators=(",", ":")) + "\n"
+
+
+def make_client(
+    responses: list[dict[str, Any]],
+    *,
+    max_wait_frames: int = 300,
+    max_time_advance_steps: int = 600,
+    max_time_advance_seconds: float = 10.0,
+) -> tuple[BevyFeedbackClient, RecordingTransport]:
+    client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+    client.max_wait_frames = max_wait_frames
+    client.max_time_advance_steps = max_time_advance_steps
+    client.max_time_advance_seconds = max_time_advance_seconds
+    client._timing_advertised = True
+    client.last_capture = None
+    client.last_capture_info = None
+    client.last_observation = None
+    client.last_error_context = None
+    transport = RecordingTransport(responses)
+    client.request = transport
+    return client, transport
+
+
+def capture_metadata(
+    path: str,
+    *,
+    label: str | None = "ready",
+    requested_frame: int = 40,
+    completed_frame: int = 42,
+    image_size: tuple[int, int] = (1280, 720),
+) -> dict[str, Any]:
+    width, height = image_size
+    request_window = {
+        "logical_width": width / 2,
+        "logical_height": height / 2,
+        "physical_width": width,
+        "physical_height": height,
+        "scale_factor": 2.0,
+        "cursor_position": [width / 4, height / 4],
+        "focused": True,
+        "visible": True,
+        "mode": "windowed",
+    }
+    completion_window = dict(request_window)
+    completion_window["cursor_position"] = [width / 3, height / 3]
+    capture = {
+        "sequence": 5,
+        "path": path,
+        "requested_frame": requested_frame,
+        "completed_frame": completed_frame,
+        "image_width": width,
+        "image_height": height,
+        "window_at_request": request_window,
+        "window_at_completion": completion_window,
+        "completion": "screenshot_captured",
+    }
+    if label is not None:
+        capture["label"] = label
+    return capture
+
+
+def capture_response(
+    path: str,
+    *,
+    label: str | None = "ready",
+    requested_frame: int = 40,
+    completed_frame: int = 42,
+    image_size: tuple[int, int] = (1280, 720),
+) -> dict[str, Any]:
+    capture = capture_metadata(
+        path,
+        label=label,
+        requested_frame=requested_frame,
+        completed_frame=completed_frame,
+        image_size=image_size,
+    )
+    return {
+        "ok": True,
+        "result": {
+            "status": "captured",
+            "frame": completed_frame,
+            "game_time_secs": 3.5,
+            "window": capture.get("window_at_completion"),
+            "mouse_position": [100.0, 50.0],
+            "pressed_keys": [],
+            "pressed_buttons": [],
+            "capture": capture,
+            "latest_capture": dict(capture),
+        },
+    }
+
+
+def diagnostic_response(observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "result": {
+            "status": "evaluated",
+            "details": dict(observation),
+        },
+    }
+
+
+def write_png(
+    directory: Path,
+    name: str,
+    size: tuple[int, int],
+    pixels: dict[tuple[int, int], tuple[int, int, int, int]] | None = None,
+) -> Path:
+    from PIL import Image
+
+    path = directory / name
+    image = Image.new("RGBA", size, (0, 0, 0, 255))
+    for point, color in (pixels or {}).items():
+        image.putpixel(point, color)
+    image.save(path)
+    return path
 
 
 class BevyFeedbackClientCoordinateHelpersTest(unittest.TestCase):
@@ -50,122 +205,946 @@ class BevyFeedbackClientCoordinateHelpersTest(unittest.TestCase):
             client.point(0.95, 0.5)
 
 
-class BevyFeedbackClientWaitTest(unittest.TestCase):
-    def test_wait_chunks_requests_above_server_frame_cap(self) -> None:
-        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        client.max_wait_frames = 300
+class BevyFeedbackClientTimingTest(unittest.TestCase):
+    def test_public_wait_is_removed_and_wait_frames_chunks_wire_wait(self) -> None:
         responses = [
-            {"ok": True, "result": {"step": 1}},
-            {"ok": True, "result": {"step": 2}},
-            {"ok": True, "result": {"step": 3}},
+            {"ok": True, "result": {"frame": 3}},
+            {"ok": True, "result": {"frame": 6}},
+            {"ok": True, "result": {"frame": 7}},
         ]
-        client.request = mock.Mock(side_effect=responses)
+        client, transport = make_client(responses, max_wait_frames=3)
 
-        response = client.wait(750)
-
-        self.assertEqual(response, responses[-1])
+        with self.assertRaises(AttributeError):
+            getattr(client, "wait")
+        self.assertEqual(client.wait_frames(7), responses[-1])
         self.assertEqual(
-            [call.args[0]["frames"] for call in client.request.call_args_list],
-            [300, 300, 150],
+            transport.requests,
+            [
+                {"command": "wait", "frames": 3},
+                {"command": "wait", "frames": 3},
+                {"command": "wait", "frames": 1},
+            ],
         )
 
-    def test_wait_under_frame_cap_uses_one_request(self) -> None:
-        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        client.max_wait_frames = 300
-        response = {"ok": True, "result": {"frames": 10}}
-        client.request = mock.Mock(return_value=response)
+        default_client, default_transport = make_client([responses[0]])
+        default_client.wait_frames()
+        self.assertEqual(
+            default_transport.requests,
+            [{"command": "wait", "frames": 1}],
+        )
 
-        self.assertEqual(client.wait(10), response)
-        client.request.assert_called_once_with({"command": "wait", "frames": 10})
+    def test_wait_frames_rejects_more_than_bounded_client_chunks(self) -> None:
+        client, transport = make_client([], max_wait_frames=2)
 
-    def test_wait_zero_passthrough_preserves_server_rejection(self) -> None:
-        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        client.max_wait_frames = 300
-        response = {"ok": True, "result": {"frames": 0}}
-        client.request = mock.Mock(return_value=response)
+        with self.assertRaisesRegex(
+            BevyFeedbackError, "requires 4097 chunks; maximum is 4096"
+        ):
+            client.wait_frames(8193)
 
-        self.assertEqual(client.wait(0), response)
-        client.request.assert_called_once_with({"command": "wait", "frames": 0})
+        self.assertEqual(transport.requests, [])
 
-
-class BevyFeedbackClientWaitUntilStableTest(unittest.TestCase):
-    def test_static_screen_returns_after_stable_polls(self) -> None:
-        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        captures = [
-            Path("initial.png"),
-            Path("stable_1.png"),
-            Path("stable_2.png"),
+    def test_wait_seconds_omits_or_includes_the_requested_frame_cap(self) -> None:
+        responses = [
+            {"ok": True, "result": {"elapsed_seconds": 0.25}},
+            {"ok": True, "result": {"elapsed_seconds": 0.5}},
         ]
-        client.capture = mock.Mock(side_effect=captures)
-        client.wait = mock.Mock()
+        client, transport = make_client(responses, max_wait_frames=12)
 
-        with mock.patch.object(bevy_feedback, "pixel_diff", return_value=0):
-            result = client.wait_until_stable(
-                frames=7, attempts=5, stable=2, label="boot"
+        client.wait_seconds(0.25)
+        client.wait_seconds(0.5, max_frames=8)
+
+        self.assertEqual(
+            transport.requests,
+            [
+                {"command": "wait_seconds", "seconds": 0.25},
+                {"command": "wait_seconds", "seconds": 0.5, "max_frames": 8},
+            ],
+        )
+
+    def test_advance_time_chunks_on_whole_steps_with_one_final_remainder(self) -> None:
+        responses = [
+            {"ok": True, "result": {"advanced": 0.2}},
+            {"ok": True, "result": {"advanced": 0.2}},
+            {"ok": True, "result": {"advanced": 0.05}},
+        ]
+        client, transport = make_client(
+            responses,
+            max_time_advance_steps=2,
+            max_time_advance_seconds=0.25,
+        )
+
+        self.assertEqual(client.advance_time(0.45, step_seconds=0.1), responses)
+        self.assertEqual(
+            transport.requests,
+            [
+                {
+                    "command": "advance_time",
+                    "seconds": 0.2,
+                    "step_seconds": 0.1,
+                },
+                {
+                    "command": "advance_time",
+                    "seconds": 0.2,
+                    "step_seconds": 0.1,
+                },
+                {
+                    "command": "advance_time",
+                    "seconds": 0.05,
+                    "step_seconds": 0.1,
+                },
+            ],
+        )
+
+    def test_advance_time_omits_step_for_one_server_bounded_request(self) -> None:
+        response = {"ok": True, "result": {"advanced": 0.125}}
+        client, transport = make_client(
+            [response],
+            max_time_advance_seconds=0.25,
+        )
+
+        self.assertEqual(client.advance_time(0.125), [response])
+        self.assertEqual(
+            transport.requests,
+            [{"command": "advance_time", "seconds": 0.125}],
+        )
+
+    def test_advance_time_rejects_more_than_bounded_client_chunks(self) -> None:
+        client, transport = make_client(
+            [],
+            max_time_advance_steps=1,
+            max_time_advance_seconds=0.001,
+        )
+
+        with self.assertRaisesRegex(
+            BevyFeedbackError, "requires 4097 chunks; maximum is 4096"
+        ):
+            client.advance_time(4.097, step_seconds=0.001)
+
+        self.assertEqual(transport.requests, [])
+
+
+class BevyFeedbackClientCaptureTest(unittest.TestCase):
+    def test_capture_payloads_retain_complete_capture_metadata(self) -> None:
+        immediate = capture_response("/captures/capture-000004.png", label=None)
+        delayed = capture_response(
+            "/captures/capture-000005-ready.png",
+            label="ready",
+            requested_frame=40,
+            completed_frame=42,
+        )
+        client, transport = make_client([immediate, delayed])
+
+        self.assertEqual(
+            client.capture(),
+            Path("/captures/capture-000004.png"),
+        )
+        self.assertEqual(
+            client.last_capture_info,
+            capture_metadata("/captures/capture-000004.png", label=None),
+        )
+        self.assertEqual(
+            client.last_capture,
+            Path("/captures/capture-000004.png"),
+        )
+        self.assertEqual(
+            client.capture_after_frames(4, "ready"),
+            Path("/captures/capture-000005-ready.png"),
+        )
+
+        expected = capture_metadata(
+            "/captures/capture-000005-ready.png",
+            label="ready",
+            requested_frame=40,
+            completed_frame=42,
+        )
+        self.assertEqual(client.last_capture_info, expected)
+        self.assertEqual(client.last_capture, Path(expected["path"]))
+        self.assertEqual(
+            transport.requests,
+            [
+                {"command": "capture"},
+                {
+                    "command": "capture_after_frames",
+                    "frames": 4,
+                    "label": "ready",
+                },
+            ],
+        )
+
+    def test_animated_readiness_then_first_capture_uses_two_atomic_requests(self) -> None:
+        predicate = {
+            "type": "state_equals",
+            "state": "AppState",
+            "value": "MainMenu",
+        }
+        observation = {
+            "predicate": predicate,
+            "outcome": "matched",
+            "observed": "MainMenu",
+            "frames_observed": 3,
+        }
+        capture = capture_response(
+            "/captures/capture-000001.png",
+            label=None,
+            requested_frame=3,
+            completed_frame=4,
+        )
+        client, transport = make_client(
+            [diagnostic_response(observation), capture],
+            max_wait_frames=20,
+        )
+
+        self.assertEqual(
+            client.wait_for_state("AppState", "MainMenu", max_frames=12),
+            observation,
+        )
+        self.assertEqual(
+            client.wait_until_first_capture(),
+            Path("/captures/capture-000001.png"),
+        )
+        self.assertEqual(
+            transport.requests,
+            [
+                {
+                    "command": "wait_for",
+                    "predicate": predicate,
+                    "max_frames": 12,
+                },
+                {"command": "capture_after_frames", "frames": 1},
+            ],
+        )
+
+
+class BevyFeedbackClientSemanticTargetTest(unittest.TestCase):
+    def test_atomic_named_click_and_disappearance_each_use_one_request(self) -> None:
+        predicate = {
+            "type": "target_absent",
+            "target": {"name": "Play"},
+            "kind": "ui",
+            "camera": "HudCamera",
+        }
+        observation = {
+            "predicate": predicate,
+            "outcome": "matched",
+            "observed": {"matches": 0},
+            "frames_observed": 2,
+        }
+        responses = [
+            {"ok": True, "result": {"status": "clicked"}},
+            diagnostic_response(observation),
+        ]
+        client, transport = make_client(responses, max_wait_frames=30)
+
+        client.click_named("Play")
+        self.assertEqual(
+            client.wait_for_target_absent(
+                {"name": "Play"},
+                kind="ui",
+                camera="HudCamera",
+                max_frames=10,
+            ),
+            observation,
+        )
+
+        self.assertEqual(
+            transport.requests,
+            [
+                {"command": "click_target", "target": {"name": "Play"}},
+                {
+                    "command": "wait_for",
+                    "predicate": predicate,
+                    "max_frames": 10,
+                },
+            ],
+        )
+
+    def test_semantic_target_methods_emit_exact_selector_payloads(self) -> None:
+        cases: list[
+            tuple[
+                str,
+                Callable[[BevyFeedbackClient], object],
+                dict[str, Any],
+            ]
+        ] = [
+            (
+                "target info",
+                lambda client: client.target_info(
+                    {"accessibility_label": "Play"},
+                    kind="ui",
+                    camera="HudCamera",
+                ),
+                {
+                    "command": "target_info",
+                    "target": {"accessibility_label": "Play"},
+                    "kind": "ui",
+                    "camera": "HudCamera",
+                },
+            ),
+            (
+                "target wait",
+                lambda client: client.wait_for_target(
+                    {"marker": "Clickable"},
+                    kind="world",
+                    camera="WorldCamera",
+                    max_frames=9,
+                ),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "target_exists",
+                        "target": {"marker": "Clickable"},
+                        "kind": "world",
+                        "camera": "WorldCamera",
+                    },
+                    "max_frames": 9,
+                },
+            ),
+            (
+                "generic click target",
+                lambda client: client.click_target(
+                    {"marker": "Enemy"},
+                    kind="world",
+                    camera="WorldCamera",
+                    button="Right",
+                    frames=3,
+                ),
+                {
+                    "command": "click_target",
+                    "target": {"marker": "Enemy"},
+                    "kind": "world",
+                    "camera": "WorldCamera",
+                    "button": "Right",
+                    "frames": 3,
+                },
+            ),
+            (
+                "accessibility click",
+                lambda client: client.click_accessibility_label(
+                    "Resume", button="Left", frames=2
+                ),
+                {
+                    "command": "click_target",
+                    "target": {"accessibility_label": "Resume"},
+                    "button": "Left",
+                    "frames": 2,
+                },
+            ),
+            (
+                "marker click",
+                lambda client: client.click_marker("Clickable"),
+                {
+                    "command": "click_target",
+                    "target": {"marker": "Clickable"},
+                },
+            ),
+        ]
+
+        for name, invoke, expected in cases:
+            with self.subTest(name=name):
+                if expected["command"] == "wait_for":
+                    predicate = expected["predicate"]
+                    response = diagnostic_response(
+                        {
+                            "predicate": predicate,
+                            "outcome": "matched",
+                            "observed": {"matches": 1},
+                        }
+                    )
+                else:
+                    response = {"ok": True, "result": {"status": "ok"}}
+                client, transport = make_client([response], max_wait_frames=10)
+
+                invoke(client)
+
+                self.assertEqual(transport.requests, [expected])
+
+    def test_selector_with_multiple_exact_keys_is_rejected_before_io(self) -> None:
+        client, transport = make_client([])
+
+        with self.assertRaisesRegex(
+            BevyFeedbackError,
+            "target must contain exactly one of name, accessibility_label, or marker",
+        ):
+            client.target_info({"name": "Play", "marker": "Clickable"})
+
+        self.assertEqual(transport.requests, [])
+
+
+class BevyFeedbackClientDiagnosticsTest(unittest.TestCase):
+    def test_resource_listing_and_scalar_field_read_use_exact_payloads(self) -> None:
+        field_observation = {
+            "resource": "RoundStats",
+            "field": "score",
+            "value": 17,
+        }
+        responses = [
+            {"ok": True, "result": {"details": {"resources": ["RoundStats"]}}},
+            {
+                "ok": True,
+                "result": {
+                    "details": {
+                        "resource": "RoundStats",
+                        "fields": ["loaded", "score"],
+                    }
+                },
+            },
+            diagnostic_response(field_observation),
+        ]
+        client, transport = make_client(responses)
+
+        client.resource_info()
+        client.resource_info("RoundStats")
+        self.assertEqual(client.read_resource_field("RoundStats", "score"), 17)
+
+        self.assertEqual(
+            transport.requests,
+            [
+                {"command": "resource_info"},
+                {"command": "resource_info", "resource": "RoundStats"},
+                {
+                    "command": "resource_info",
+                    "resource": "RoundStats",
+                    "field": "score",
+                },
+            ],
+        )
+
+    def test_diagnostic_methods_return_structured_observations(self) -> None:
+        cases: list[
+            tuple[
+                str,
+                Callable[[BevyFeedbackClient], object],
+                dict[str, Any],
+            ]
+        ] = [
+            (
+                "evaluate predicate",
+                lambda client: client.evaluate_predicate(
+                    {
+                        "type": "resource_field",
+                        "resource": "RoundStats",
+                        "field": "loaded",
+                        "operator": "eq",
+                        "value": True,
+                    }
+                ),
+                {
+                    "command": "evaluate_predicate",
+                    "predicate": {
+                        "type": "resource_field",
+                        "resource": "RoundStats",
+                        "field": "loaded",
+                        "operator": "eq",
+                        "value": True,
+                    },
+                },
+            ),
+            (
+                "generic wait",
+                lambda client: client.wait_for(
+                    {"type": "state_equals", "state": "AppState", "value": "Ready"}
+                ),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "state_equals",
+                        "state": "AppState",
+                        "value": "Ready",
+                    },
+                },
+            ),
+            (
+                "state wait",
+                lambda client: client.wait_for_state(
+                    "AppState", "Playing", max_frames=11
+                ),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "state_equals",
+                        "state": "AppState",
+                        "value": "Playing",
+                    },
+                    "max_frames": 11,
+                },
+            ),
+            (
+                "resource wait",
+                lambda client: client.wait_for_resource(
+                    "RoundStats", "score", "gte", 10, max_frames=12
+                ),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "resource_field",
+                        "resource": "RoundStats",
+                        "field": "score",
+                        "operator": "gte",
+                        "value": 10,
+                    },
+                    "max_frames": 12,
+                },
+            ),
+            (
+                "bounded marker count wait",
+                lambda client: client.wait_for_marker_count(
+                    "Enemy", min_count=2, max_count=5, max_frames=13
+                ),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "marker_count",
+                        "marker": "Enemy",
+                        "min": 2,
+                        "max": 5,
+                    },
+                    "max_frames": 13,
+                },
+            ),
+            (
+                "marker presence wait",
+                lambda client: client.wait_for_marker_present("Clickable"),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "marker_count",
+                        "marker": "Clickable",
+                        "min": 1,
+                    },
+                },
+            ),
+            (
+                "marker absence wait",
+                lambda client: client.wait_for_marker_absent(
+                    "LoadingSpinner", max_frames=14
+                ),
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "marker_count",
+                        "marker": "LoadingSpinner",
+                        "max": 0,
+                    },
+                    "max_frames": 14,
+                },
+            ),
+        ]
+
+        for name, invoke, expected in cases:
+            with self.subTest(name=name):
+                predicate = expected["predicate"]
+                observation = {
+                    "predicate": predicate,
+                    "outcome": "matched",
+                    "observed": {"value": 17, "count": 2},
+                    "frames_observed": 4,
+                }
+                client, transport = make_client(
+                    [diagnostic_response(observation)],
+                    max_wait_frames=20,
+                )
+
+                self.assertEqual(invoke(client), observation)
+                self.assertEqual(client.last_observation, observation)
+                self.assertEqual(transport.requests, [expected])
+
+
+class BevyFeedbackClientPredicateAssertionsTest(unittest.TestCase):
+    def test_assertion_methods_evaluate_exact_predicates(self) -> None:
+        cases: list[
+            tuple[
+                str,
+                Callable[[BevyFeedbackClient], object],
+                dict[str, Any],
+            ]
+        ] = [
+            (
+                "state",
+                lambda client: client.assert_state("AppState", "Playing"),
+                {
+                    "type": "state_equals",
+                    "state": "AppState",
+                    "value": "Playing",
+                },
+            ),
+            (
+                "resource",
+                lambda client: client.assert_resource(
+                    "RoundStats", "score", "gte", 20
+                ),
+                {
+                    "type": "resource_field",
+                    "resource": "RoundStats",
+                    "field": "score",
+                    "operator": "gte",
+                    "value": 20,
+                },
+            ),
+            (
+                "marker count",
+                lambda client: client.assert_marker_count(
+                    "Enemy", min_count=1, max_count=4
+                ),
+                {
+                    "type": "marker_count",
+                    "marker": "Enemy",
+                    "min": 1,
+                    "max": 4,
+                },
+            ),
+            (
+                "marker present",
+                lambda client: client.assert_marker_present("Clickable"),
+                {
+                    "type": "marker_count",
+                    "marker": "Clickable",
+                    "min": 1,
+                },
+            ),
+            (
+                "marker absent",
+                lambda client: client.assert_marker_absent("LoadingSpinner"),
+                {
+                    "type": "marker_count",
+                    "marker": "LoadingSpinner",
+                    "max": 0,
+                },
+            ),
+            (
+                "target exists",
+                lambda client: client.assert_target_exists(
+                    {"accessibility_label": "Play"}, kind="ui"
+                ),
+                {
+                    "type": "target_exists",
+                    "target": {"accessibility_label": "Play"},
+                    "kind": "ui",
+                },
+            ),
+            (
+                "target absent",
+                lambda client: client.assert_target_absent(
+                    {"name": "BlockingModal"},
+                    kind="ui",
+                    camera="HudCamera",
+                ),
+                {
+                    "type": "target_absent",
+                    "target": {"name": "BlockingModal"},
+                    "kind": "ui",
+                    "camera": "HudCamera",
+                },
+            ),
+        ]
+
+        for name, invoke, predicate in cases:
+            with self.subTest(name=name):
+                observation = {
+                    "predicate": predicate,
+                    "outcome": "matched",
+                    "observed": {"count": 1},
+                }
+                client, transport = make_client(
+                    [diagnostic_response(observation)]
+                )
+
+                invoke(client)
+
+                self.assertEqual(
+                    transport.requests,
+                    [
+                        {
+                            "command": "evaluate_predicate",
+                            "predicate": predicate,
+                        }
+                    ],
+                )
+
+    def test_assertion_rejects_indeterminate_with_structured_observation(self) -> None:
+        predicate = {
+            "type": "marker_count",
+            "marker": "Enemy",
+            "max": 0,
+        }
+        observation = {
+            "predicate": predicate,
+            "outcome": "indeterminate",
+            "reason": "entity_scan_truncated",
+            "observed": {"count_lower_bound": 256},
+        }
+        client, _transport = make_client([diagnostic_response(observation)])
+
+        with self.assertRaisesRegex(
+            BevyFeedbackError,
+            'predicate assertion failed: .*"outcome":"indeterminate".*'
+            '"reason":"entity_scan_truncated"',
+        ):
+            client.assert_marker_absent("Enemy")
+
+        self.assertEqual(client.last_observation, observation)
+
+
+class BevyFeedbackClientImageHelpersTest(unittest.TestCase):
+    def test_physical_include_and_masks_count_only_visible_changed_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            before = write_png(directory, "before.png", (5, 4))
+            after = write_png(
+                directory,
+                "after.png",
+                (5, 4),
+                {
+                    (0, 0): (255, 0, 0, 255),
+                    (1, 1): (255, 0, 0, 255),
+                    (2, 1): (255, 0, 0, 255),
+                    (4, 3): (255, 0, 0, 255),
+                },
+            )
+            include = (1, 1, 4, 3)
+            masks = ((1, 1, 1, 1),)
+
+            self.assertEqual(bevy_feedback.pixel_diff(before, after), 4)
+            self.assertEqual(
+                bevy_feedback.pixel_diff(before, after, include=include),
+                3,
+            )
+            self.assertEqual(
+                bevy_feedback.pixel_diff(
+                    before,
+                    after,
+                    include=include,
+                    masks=masks,
+                ),
+                2,
+            )
+            self.assertEqual(
+                bevy_feedback.region_diff(
+                    before,
+                    after,
+                    include,
+                    masks=masks,
+                ),
+                2,
             )
 
-        self.assertEqual(result, captures[2])
-        self.assertEqual(client.wait.call_count, 2)
+            client, _transport = make_client([])
+            client.assert_changed(
+                before,
+                after,
+                min_pixels=2,
+                include=include,
+                masks=masks,
+            )
+            with self.assertRaisesRegex(
+                BevyFeedbackError, "changed 2 pixels, expected at least 3"
+            ):
+                client.assert_region_changed(
+                    before,
+                    after,
+                    include,
+                    min_pixels=3,
+                    masks=masks,
+                )
 
-    def test_change_resets_stable_streak(self) -> None:
-        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        captures = [
-            Path("initial.png"),
-            Path("changed.png"),
-            Path("stable_1.png"),
-            Path("stable_2.png"),
+    def test_resize_is_explicit_and_stability_restarts_on_new_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            initial = write_png(directory, "initial.png", (2, 2))
+            resized = write_png(directory, "resized.png", (3, 2))
+            stable_one = write_png(directory, "stable-one.png", (3, 2))
+            stable_two = write_png(directory, "stable-two.png", (3, 2))
+
+            with self.assertRaisesRegex(
+                BevyFeedbackError,
+                r"image dimensions differ: \(2, 2\) vs \(3, 2\).*window resized",
+            ):
+                bevy_feedback.pixel_diff(initial, resized)
+
+            responses = [
+                capture_response(
+                    str(initial), label=None, image_size=(2, 2)
+                ),
+                capture_response(
+                    str(resized), label=None, image_size=(3, 2)
+                ),
+                capture_response(
+                    str(stable_one), label=None, image_size=(3, 2)
+                ),
+                capture_response(
+                    str(stable_two), label=None, image_size=(3, 2)
+                ),
+            ]
+            client, transport = make_client(responses, max_wait_frames=5)
+
+            self.assertEqual(
+                client.wait_until_stable(frames=2, attempts=3, stable=2),
+                stable_two,
+            )
+            self.assertEqual(
+                transport.requests,
+                [
+                    {"command": "capture"},
+                    {"command": "capture_after_frames", "frames": 2},
+                    {"command": "capture_after_frames", "frames": 2},
+                    {"command": "capture_after_frames", "frames": 2},
+                ],
+            )
+
+    def test_change_polling_stops_at_the_attempt_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            before = write_png(directory, "before.png", (2, 2))
+            unchanged = write_png(directory, "unchanged.png", (2, 2))
+            responses = [
+                capture_response(
+                    str(unchanged),
+                    label="probe",
+                    image_size=(2, 2),
+                )
+                for _ in range(3)
+            ]
+            client, transport = make_client(responses, max_wait_frames=2)
+
+            with self.assertRaisesRegex(
+                BevyFeedbackError, "screenshot did not change"
+            ):
+                client.wait_until_changed(
+                    before,
+                    frames=1,
+                    attempts=3,
+                    label="probe",
+                    include=(0, 0, 2, 2),
+                    masks=((0, 0, 1, 1),),
+                )
+
+            self.assertEqual(
+                transport.requests,
+                [
+                    {
+                        "command": "capture_after_frames",
+                        "frames": 1,
+                        "label": "probe",
+                    }
+                    for _ in range(3)
+                ],
+            )
+
+    def test_all_visual_retry_loops_reject_unbounded_attempts_before_io(self) -> None:
+        attempts = bevy_feedback.MAX_CLIENT_CHUNKS + 1
+        cases: list[
+            tuple[str, Callable[[BevyFeedbackClient], object]]
+        ] = [
+            (
+                "changed",
+                lambda client: client.wait_until_changed(
+                    "before.png", attempts=attempts
+                ),
+            ),
+            (
+                "stable",
+                lambda client: client.wait_until_stable(attempts=attempts),
+            ),
+            (
+                "color",
+                lambda client: client.wait_until_color(
+                    (255, 0, 0), (0, 0, 1, 1), attempts=attempts
+                ),
+            ),
+            (
+                "text",
+                lambda client: client.wait_until_text(
+                    "Ready", attempts=attempts
+                ),
+            ),
         ]
-        client.capture = mock.Mock(side_effect=captures)
-        client.wait = mock.Mock()
 
-        with mock.patch.object(bevy_feedback, "pixel_diff", side_effect=[1, 0, 0]):
-            result = client.wait_until_stable(frames=7, attempts=3, stable=2)
+        for name, invoke in cases:
+            with self.subTest(name=name):
+                client, transport = make_client([])
+                with self.assertRaisesRegex(
+                    BevyFeedbackError,
+                    "attempts must not exceed client bound 4096",
+                ):
+                    invoke(client)
+                self.assertEqual(transport.requests, [])
 
-        self.assertEqual(result, captures[3])
-        self.assertEqual(client.wait.call_count, 3)
 
-    def test_raises_after_attempts_without_stabilizing(self) -> None:
-        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        client.capture = mock.Mock(
-            side_effect=[
-                Path("initial.png"),
-                Path("changed_1.png"),
-                Path("changed_2.png"),
-                Path("changed_3.png"),
+class BevyFeedbackClientErrorContextTest(unittest.TestCase):
+    def test_request_retains_structured_error_capture_and_predicate_context(self) -> None:
+        capture = capture_metadata(
+            "/captures/capture-000009-failure.png",
+            label="failure",
+            requested_frame=90,
+            completed_frame=92,
+        )
+        observed_predicate = {
+            "predicate": {
+                "type": "target_absent",
+                "target": {"name": "BlockingModal"},
+            },
+            "outcome": "not_matched",
+            "observed": {"matches": 1},
+            "frames_observed": 10,
+        }
+        context = {
+            "latest_capture": capture,
+            "observed_predicate": observed_predicate,
+            "frame": 92,
+        }
+        stream = JsonLineStream(
+            [
+                {
+                    "id": 7,
+                    "ok": False,
+                    "error": {
+                        "code": "timeout",
+                        "message": "target did not disappear",
+                        "context": context,
+                    },
+                }
             ]
         )
-        client.wait = mock.Mock()
-
-        with (
-            mock.patch.object(bevy_feedback, "pixel_diff", return_value=1),
-            self.assertRaisesRegex(BevyFeedbackError, "did not stabilize"),
-        ):
-            client.wait_until_stable(frames=7, attempts=3, stable=2)
-
-    def test_dimension_mismatch_is_treated_as_change(self) -> None:
         client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-        captures = [
-            Path("initial.png"),
-            Path("resized.png"),
-            Path("stable_1.png"),
-            Path("stable_2.png"),
-        ]
-        client.capture = mock.Mock(side_effect=captures)
-        client.wait = mock.Mock()
+        client._stream = stream
+        client._next_id = 7
+        client._transcript = None
+        client.timeout = 1.0
+        client.last_capture = None
+        client.last_capture_info = None
+        client.last_observation = None
+        client.last_error_context = None
+        request = {
+            "command": "wait_for",
+            "predicate": observed_predicate["predicate"],
+            "max_frames": 10,
+        }
 
-        with mock.patch.object(
-            bevy_feedback,
-            "pixel_diff",
-            side_effect=[
-                BevyFeedbackError("image dimensions differ: 1x1 vs 2x2"),
-                0,
-                0,
-            ],
-        ):
-            result = client.wait_until_stable(frames=7, attempts=3, stable=2)
+        with self.assertRaises(BevyFeedbackError) as raised:
+            client.request(request)
 
-        self.assertEqual(result, captures[3])
+        message = str(raised.exception)
+        self.assertIn("command failed [timeout]: target did not disappear", message)
+        self.assertIn(
+            "last captured frame: /captures/capture-000009-failure.png",
+            message,
+        )
+        self.assertIn('"outcome":"not_matched"', message)
+        self.assertEqual(
+            stream.requests,
+            [{**request, "id": 7}],
+        )
+        self.assertEqual(client.last_error_context, context)
+        self.assertEqual(client.last_capture_info, capture)
+        self.assertEqual(client.last_capture, Path(capture["path"]))
+        self.assertEqual(client.last_observation, observed_predicate)
 
+
+class BevyFeedbackClientBundleParityTest(unittest.TestCase):
+    def test_bundled_client_is_byte_identical_to_the_canonical_client(self) -> None:
+        canonical = ROOT / "clients" / "python" / "bevy_feedback.py"
+        bundled = ROOT / "skills" / "driving-bevy-games" / "bevy_feedback.py"
+
+        self.assertEqual(canonical.read_bytes(), bundled.read_bytes())
 
 class BevyFeedbackRunBoundaryTest(unittest.TestCase):
     def test_fail_raises_client_error_with_message(self) -> None:

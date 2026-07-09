@@ -1,6 +1,6 @@
 [package]
 name = "bevy-agent-feedback-plugin"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 description = "Let AI coding agents see and control your Bevy app: input injection, labeled screenshots, and frame-synced feedback over a JSON-lines TCP protocol."
 readme = "README.md"
@@ -37,7 +37,7 @@ ctrlc = "3"
 
 [features]
 default = []
-diagnostics = ["bevy/bevy_state"]
+diagnostics = ["bevy/bevy_state", "bevy/bevy_ui"]
 
 [dev-dependencies]
 bevy = { version = "0.19.0", default-features = false, features = ["3d", "ui"] }

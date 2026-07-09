@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import subprocess
 import time
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Any, Callable, Iterable, NoReturn
+from typing import Any, Callable, Iterable, NoReturn, Sequence
 
 PROTOCOL_VERSION = "bevy-agent-feedback/2"
 DEFAULT_MAX_WAIT_FRAMES = 300
+DEFAULT_MAX_TIME_ADVANCE_STEPS = 600
+DEFAULT_MAX_TIME_ADVANCE_SECONDS = 10.0
+NANOSECONDS_PER_SECOND = 1_000_000_000
+MAX_CLIENT_CHUNKS = 4096
 
 
 class BevyFeedbackError(RuntimeError):
@@ -40,12 +46,35 @@ class BevyFeedbackClient:
         self.tesseract = str(tesseract or os.environ.get("BEVY_FEEDBACK_TESSERACT") or "tesseract")
         self.ocr_language = ocr_language
         self.ocr_timeout = ocr_timeout
-        self._last_capture: Path | None = None
+        self.last_capture: Path | None = None
+        self.last_capture_info: dict[str, Any] | None = None
+        self.last_observation: dict[str, Any] | None = None
+        self.last_error_context: dict[str, Any] | None = None
         transcript = transcript_file or os.environ.get("BEVY_FEEDBACK_TRANSCRIPT")
         self._transcript = open(transcript, "a", encoding="utf-8") if transcript else None
         protocol = self._read_protocol()
         self.capture_dir = Path(protocol.get("capture_dir", "."))
-        self.max_wait_frames = int(protocol.get("max_wait_frames", DEFAULT_MAX_WAIT_FRAMES))
+        commands = protocol.get("commands")
+        additive_timing = isinstance(commands, dict) and "advance_time" in commands
+        self._timing_advertised = additive_timing
+        self.max_wait_frames = _protocol_positive_int(
+            protocol, "max_wait_frames", DEFAULT_MAX_WAIT_FRAMES, additive_timing
+        )
+        self.deterministic_time = _protocol_bool(
+            protocol, "deterministic_time", False, additive_timing
+        )
+        self.max_time_advance_steps = _protocol_positive_int(
+            protocol,
+            "max_time_advance_steps",
+            DEFAULT_MAX_TIME_ADVANCE_STEPS,
+            additive_timing,
+        )
+        self.max_time_advance_seconds = _protocol_positive_float(
+            protocol,
+            "max_time_advance_seconds",
+            DEFAULT_MAX_TIME_ADVANCE_SECONDS,
+            additive_timing,
+        )
         host, port = protocol["socket_addr"].rsplit(":", 1)
         try:
             self._socket = socket.create_connection((host, int(port)), timeout=timeout)
@@ -98,11 +127,21 @@ class BevyFeedbackClient:
         response = json.loads(response_line)
         self._write_transcript(ts_ms, int((time.monotonic() - started) * 1000), request, response)
         if response.get("ok") is True:
+            self._retain_response_context(response)
             return response
         error = response.get("error") or {}
+        context = error.get("context")
+        self.last_error_context = dict(context) if isinstance(context, dict) else None
+        if self.last_error_context is not None:
+            self._retain_context(self.last_error_context)
         message = error.get("message", response)
         if error.get("code") == "timeout":
             message = self._with_last_capture(str(message))
+        if self.last_error_context is not None:
+            message = (
+                f"{message}; context="
+                f"{json.dumps(self.last_error_context, sort_keys=True, separators=(',', ':'))}"
+            )
         raise BevyFeedbackError(f"command failed [{error.get('code', 'error')}]: {message}")
 
     def replay_jsonl(self, path: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -118,26 +157,106 @@ class BevyFeedbackClient:
                 responses.append(self.request(request))
         return responses
 
-    def wait(self, frames: int = 1) -> dict[str, Any]:
-        """Advance frames; requests above the server's max_wait_frames cap are chunked."""
-        cap = max(1, int(getattr(self, "max_wait_frames", DEFAULT_MAX_WAIT_FRAMES)))
-        if frames <= cap:
-            return self.request({"command": "wait", "frames": frames})
+    def wait_frames(self, frames: int = 1) -> dict[str, Any]:
+        """Wait for a bounded number of app updates, chunking at the advertised cap."""
+        frames = _positive_int("frames", frames)
+        cap = _positive_int("max_wait_frames", self.max_wait_frames)
         response: dict[str, Any] = {}
-        remaining = frames
-        while remaining > 0:
-            step = min(remaining, cap)
-            response = self.request({"command": "wait", "frames": step})
-            remaining -= step
+        chunks = (frames + cap - 1) // cap
+        if chunks > MAX_CLIENT_CHUNKS:
+            raise BevyFeedbackError(
+                f"wait_frames requires {chunks} chunks; maximum is {MAX_CLIENT_CHUNKS}"
+            )
+        for index in range(chunks):
+            chunk = min(frames - index * cap, cap)
+            response = self.request({"command": "wait", "frames": chunk})
         return response
+
+    def wait_seconds(
+        self, seconds: float, *, max_frames: int | None = None
+    ) -> dict[str, Any]:
+        if not getattr(self, "_timing_advertised", True):
+            raise BevyFeedbackError("wait_seconds is not advertised by this running game")
+        seconds = _positive_seconds("seconds", seconds)
+        request: dict[str, Any] = {"command": "wait_seconds", "seconds": seconds}
+        if max_frames is not None:
+            max_frames = _positive_int("max_frames", max_frames)
+            if max_frames > self.max_wait_frames:
+                raise BevyFeedbackError(
+                    f"max_frames must not exceed advertised max_wait_frames {self.max_wait_frames}"
+                )
+            request["max_frames"] = max_frames
+        return self.request(request)
+
+    def advance_time(
+        self, seconds: float, *, step_seconds: float | None = None
+    ) -> list[dict[str, Any]]:
+        if not getattr(self, "_timing_advertised", True):
+            raise BevyFeedbackError("advance_time is not advertised by this running game")
+        total_ns = _duration_nanoseconds("seconds", seconds)
+        cap_ns = _duration_nanoseconds(
+            "max_time_advance_seconds", self.max_time_advance_seconds
+        )
+        step_ns = (
+            _duration_nanoseconds("step_seconds", step_seconds)
+            if step_seconds is not None
+            else None
+        )
+        if step_ns is None:
+            if total_ns > cap_ns:
+                raise BevyFeedbackError(
+                    "advance_time requires explicit step_seconds when chunking; "
+                    "the server's default nominal step is not discoverable"
+                )
+            chunks = [total_ns]
+        else:
+            chunk_steps = min(
+                self.max_time_advance_steps,
+                cap_ns // step_ns,
+            )
+            if chunk_steps < 1:
+                raise BevyFeedbackError(
+                    "step_seconds exceeds advertised max_time_advance_seconds"
+                )
+            chunk_ns = chunk_steps * step_ns
+            chunk_count = (total_ns + chunk_ns - 1) // chunk_ns
+            if chunk_count > MAX_CLIENT_CHUNKS:
+                raise BevyFeedbackError(
+                    f"advance_time requires {chunk_count} chunks; maximum is {MAX_CLIENT_CHUNKS}"
+                )
+            chunks = []
+            remaining_ns = total_ns
+            for _ in range(chunk_count):
+                current_ns = min(remaining_ns, chunk_ns)
+                chunks.append(current_ns)
+                remaining_ns -= current_ns
+        responses = []
+        for chunk_ns in chunks:
+            request = {
+                "command": "advance_time",
+                "seconds": chunk_ns / NANOSECONDS_PER_SECOND,
+            }
+            if step_ns is not None:
+                request["step_seconds"] = step_ns / NANOSECONDS_PER_SECOND
+            responses.append(self.request(request))
+        return responses
 
     def capture(self, label: str | None = None) -> Path:
         request: dict[str, Any] = {"command": "capture"}
         if label is not None:
             request["label"] = label
-        response = self.request(request)
-        self._last_capture = Path(response["result"]["capture"]["path"])
-        return self._last_capture
+        return self._record_capture(self.request(request))
+
+    def capture_after_frames(self, frames: int, label: str | None = None) -> Path:
+        frames = _bounded_frames("frames", frames, self.max_wait_frames)
+        request: dict[str, Any] = {"command": "capture_after_frames", "frames": frames}
+        if label is not None:
+            request["label"] = label
+        return self._record_capture(self.request(request))
+
+    def wait_until_first_capture(self) -> Path:
+        """Return the first completion-confirmed delayed capture."""
+        return self.capture_after_frames(1)
 
     def window_info(self) -> dict[str, Any]:
         return self.request({"command": "window_info"})
@@ -207,14 +326,255 @@ class BevyFeedbackClient:
     def shutdown(self) -> dict[str, Any]:
         return self.request({"command": "shutdown"})
 
+    def target_info(
+        self,
+        target: dict[str, str],
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+    ) -> dict[str, Any]:
+        request = _target_request("target_info", target, kind, camera)
+        return self.request(request)
+
+    def wait_for_target(
+        self,
+        target: dict[str, str],
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+        max_frames: int | None = None,
+    ) -> dict[str, Any]:
+        predicate = _target_predicate("target_exists", target, kind, camera)
+        return self.wait_for(predicate, max_frames=max_frames)
+
+    def wait_for_target_absent(
+        self,
+        target: dict[str, str],
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+        max_frames: int | None = None,
+    ) -> dict[str, Any]:
+        predicate = _target_predicate("target_absent", target, kind, camera)
+        return self.wait_for(predicate, max_frames=max_frames)
+
+    def click_target(
+        self,
+        target: dict[str, str],
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+        button: str | None = None,
+        frames: int | None = None,
+    ) -> dict[str, Any]:
+        request = _target_request("click_target", target, kind, camera)
+        if button is not None:
+            request["button"] = button
+        if frames is not None:
+            request["frames"] = _bounded_frames("frames", frames, self.max_wait_frames)
+        return self.request(request)
+
+    def click_named(
+        self,
+        name: str,
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+        button: str | None = None,
+        frames: int | None = None,
+    ) -> dict[str, Any]:
+        return self.click_target(
+            {"name": name}, kind=kind, camera=camera, button=button, frames=frames
+        )
+
+    def click_accessibility_label(
+        self,
+        label: str,
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+        button: str | None = None,
+        frames: int | None = None,
+    ) -> dict[str, Any]:
+        return self.click_target(
+            {"accessibility_label": label},
+            kind=kind,
+            camera=camera,
+            button=button,
+            frames=frames,
+        )
+
+    def click_marker(
+        self,
+        marker: str,
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+        button: str | None = None,
+        frames: int | None = None,
+    ) -> dict[str, Any]:
+        return self.click_target(
+            {"marker": marker}, kind=kind, camera=camera, button=button, frames=frames
+        )
+
+    def resource_info(
+        self, resource: str | None = None, field: str | None = None
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {"command": "resource_info"}
+        if resource is not None:
+            request["resource"] = resource
+        if field is not None:
+            request["field"] = field
+        return self.request(request)
+
+    def read_resource_field(self, resource: str, field: str) -> Any:
+        response = self.resource_info(resource, field)
+        details = _response_details(response)
+        if "value" not in details:
+            raise BevyFeedbackError(f"resource_info response missing field value: {response}")
+        return details["value"]
+
+    def evaluate_predicate(self, predicate: dict[str, Any]) -> dict[str, Any]:
+        response = self.request(
+            {"command": "evaluate_predicate", "predicate": dict(predicate)}
+        )
+        return self._record_observation(response)
+
+    def wait_for(
+        self,
+        predicate: dict[str, Any],
+        *,
+        max_frames: int | None = None,
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "command": "wait_for",
+            "predicate": dict(predicate),
+        }
+        if max_frames is not None:
+            request["max_frames"] = _bounded_frames(
+                "max_frames", max_frames, self.max_wait_frames
+            )
+        response = self.request(request)
+        return self._record_observation(response)
+
+    def wait_for_state(
+        self, state: str, value: Any, *, max_frames: int | None = None
+    ) -> dict[str, Any]:
+        return self.wait_for(
+            {"type": "state_equals", "state": state, "value": value},
+            max_frames=max_frames,
+        )
+
+    def wait_for_resource(
+        self,
+        resource: str,
+        field: str,
+        operator: str,
+        value: Any,
+        *,
+        max_frames: int | None = None,
+    ) -> dict[str, Any]:
+        return self.wait_for(
+            {
+                "type": "resource_field",
+                "resource": resource,
+                "field": field,
+                "operator": operator,
+                "value": value,
+            },
+            max_frames=max_frames,
+        )
+
+    def wait_for_marker_count(
+        self,
+        marker: str,
+        *,
+        min_count: int | None = None,
+        max_count: int | None = None,
+        max_frames: int | None = None,
+    ) -> dict[str, Any]:
+        predicate = _marker_predicate(marker, min_count, max_count)
+        return self.wait_for(predicate, max_frames=max_frames)
+
+    def wait_for_marker_present(
+        self, marker: str, *, max_frames: int | None = None
+    ) -> dict[str, Any]:
+        return self.wait_for_marker_count(
+            marker, min_count=1, max_frames=max_frames
+        )
+
+    def wait_for_marker_absent(
+        self, marker: str, *, max_frames: int | None = None
+    ) -> dict[str, Any]:
+        return self.wait_for_marker_count(
+            marker, max_count=0, max_frames=max_frames
+        )
+
+    def assert_state(self, state: str, value: Any) -> None:
+        self._assert_predicate(
+            {"type": "state_equals", "state": state, "value": value}
+        )
+
+    def assert_resource(
+        self, resource: str, field: str, operator: str, value: Any
+    ) -> None:
+        self._assert_predicate(
+            {
+                "type": "resource_field",
+                "resource": resource,
+                "field": field,
+                "operator": operator,
+                "value": value,
+            }
+        )
+
+    def assert_marker_count(
+        self,
+        marker: str,
+        *,
+        min_count: int | None = None,
+        max_count: int | None = None,
+    ) -> None:
+        self._assert_predicate(_marker_predicate(marker, min_count, max_count))
+
+    def assert_marker_present(self, marker: str) -> None:
+        self.assert_marker_count(marker, min_count=1)
+
+    def assert_marker_absent(self, marker: str) -> None:
+        self.assert_marker_count(marker, max_count=0)
+
+    def assert_target_exists(
+        self,
+        target: dict[str, str],
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+    ) -> None:
+        self._assert_predicate(
+            _target_predicate("target_exists", target, kind, camera)
+        )
+
+    def assert_target_absent(
+        self,
+        target: dict[str, str],
+        *,
+        kind: str | None = None,
+        camera: str | None = None,
+    ) -> None:
+        self._assert_predicate(
+            _target_predicate("target_absent", target, kind, camera)
+        )
+
     def assert_changed(
         self,
         before: str | os.PathLike[str],
         after: str | os.PathLike[str],
         *,
         min_pixels: int = 1,
+        include: tuple[int, int, int, int] | None = None,
+        masks: Sequence[tuple[int, int, int, int]] = (),
     ) -> None:
-        changed = pixel_diff(before, after)
+        changed = pixel_diff(before, after, include=include, masks=masks)
         if changed < min_pixels:
             raise BevyFeedbackError(
                 f"screenshots changed {changed} pixels, expected at least {min_pixels}: {before} and {after}"
@@ -227,8 +587,9 @@ class BevyFeedbackClient:
         region: tuple[int, int, int, int],
         *,
         min_pixels: int = 1,
+        masks: Sequence[tuple[int, int, int, int]] = (),
     ) -> None:
-        changed = region_diff(before, after, region)
+        changed = region_diff(before, after, region, masks=masks)
         if changed < min_pixels:
             raise BevyFeedbackError(
                 f"region {region} changed {changed} pixels, expected at least {min_pixels}: {before} and {after}"
@@ -256,11 +617,15 @@ class BevyFeedbackClient:
         frames: int = 1,
         attempts: int = 30,
         label: str | None = None,
+        include: tuple[int, int, int, int] | None = None,
+        masks: Sequence[tuple[int, int, int, int]] = (),
     ) -> Path:
+        masks = _bounded_masks(masks)
+        attempts = _bounded_attempts(attempts)
+        frames = _bounded_frames("frames", frames, self.max_wait_frames)
         for _ in range(attempts):
-            self.wait(frames)
-            after = self.capture(label)
-            if pixel_diff(before, after) > 0:
+            after = self.capture_after_frames(frames, label)
+            if pixel_diff(before, after, include=include, masks=masks) > 0:
                 return after
         raise BevyFeedbackError("screenshot did not change")
 
@@ -271,20 +636,20 @@ class BevyFeedbackClient:
         attempts: int = 30,
         stable: int = 2,
         label: str | None = None,
+        include: tuple[int, int, int, int] | None = None,
+        masks: Sequence[tuple[int, int, int, int]] = (),
     ) -> Path:
-        """Wait until `stable` consecutive captures are pixel-identical; returns the last capture.
-
-        Use after boot instead of wait_until_changed: a settled static screen passes
-        immediately instead of burning the full attempts budget.
-        """
-        stable = max(1, stable)
+        """Wait until `stable` consecutive captures are pixel-identical."""
+        attempts = _bounded_attempts(attempts)
+        stable = _bounded_attempts(stable)
+        frames = _bounded_frames("frames", frames, self.max_wait_frames)
+        masks = _bounded_masks(masks)
         previous = self.capture(label)
         streak = 0
         for _ in range(attempts):
-            self.wait(frames)
-            current = self.capture(label)
+            current = self.capture_after_frames(frames, label)
             try:
-                changed = pixel_diff(previous, current)
+                changed = pixel_diff(previous, current, include=include, masks=masks)
             except BevyFeedbackError as error:
                 if "image dimensions differ" not in str(error):
                     raise
@@ -297,7 +662,8 @@ class BevyFeedbackClient:
                 streak = 0
             previous = current
         raise BevyFeedbackError(
-            f"screen did not stabilize after {attempts} polls of {frames} frames"
+            f"screen did not stabilize: attempts={attempts}, frames={frames}, "
+            f"include={include}, masks={masks}, last_capture={self.last_capture_info}"
         )
 
     def wait_until_color(
@@ -310,9 +676,10 @@ class BevyFeedbackClient:
         attempts: int = 30,
         label: str | None = None,
     ) -> Path:
+        attempts = _bounded_attempts(attempts)
+        frames = _bounded_frames("frames", frames, self.max_wait_frames)
         for _ in range(attempts):
-            self.wait(frames)
-            capture = self.capture(label)
+            capture = self.capture_after_frames(frames, label)
             if image_has_color(capture, color, region, tolerance):
                 return capture
         raise BevyFeedbackError(f"color did not appear: {color}")
@@ -349,9 +716,10 @@ class BevyFeedbackClient:
         attempts: int = 30,
         label: str | None = None,
     ) -> Path:
+        attempts = _bounded_attempts(attempts)
+        frames = _bounded_frames("frames", frames, self.max_wait_frames)
         for _ in range(attempts):
-            self.wait(frames)
-            capture = self.capture(label)
+            capture = self.capture_after_frames(frames, label)
             try:
                 self.assert_text(capture, expected)
                 return capture
@@ -359,6 +727,44 @@ class BevyFeedbackClient:
                 if not str(error).startswith("OCR text did not contain"):
                     raise
         raise BevyFeedbackError(f"text did not appear: {expected}")
+
+    def _record_observation(self, response: dict[str, Any]) -> dict[str, Any]:
+        observation = _response_details(response)
+        self.last_observation = dict(observation)
+        return self.last_observation
+
+    def _assert_predicate(self, predicate: dict[str, Any]) -> None:
+        observation = self.evaluate_predicate(predicate)
+        if observation.get("outcome") != "matched":
+            raise BevyFeedbackError(
+                "predicate assertion failed: "
+                f"{json.dumps(observation, sort_keys=True, separators=(',', ':'))}"
+            )
+
+    def _retain_response_context(self, response: dict[str, Any]) -> None:
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return
+        latest_capture = result.get("latest_capture")
+        if isinstance(latest_capture, dict):
+            self._retain_capture_info(latest_capture)
+        details = result.get("details")
+        if isinstance(details, dict) and isinstance(details.get("predicate"), dict):
+            self.last_observation = dict(details)
+
+    def _retain_context(self, context: dict[str, Any]) -> None:
+        latest_capture = context.get("latest_capture")
+        if isinstance(latest_capture, dict):
+            self._retain_capture_info(latest_capture)
+        observation = context.get("observed_predicate")
+        if isinstance(observation, dict):
+            self.last_observation = dict(observation)
+
+    def _retain_capture_info(self, capture: dict[str, Any]) -> None:
+        self.last_capture_info = dict(capture)
+        path = capture.get("path")
+        if isinstance(path, str):
+            self.last_capture = Path(path)
 
     def _write_transcript(
         self,
@@ -392,9 +798,21 @@ class BevyFeedbackClient:
             raise BevyFeedbackError(f"window_info response missing logical window dimensions: {response}")
         return (float(width), float(height))
 
+    def _record_capture(self, response: dict[str, Any]) -> Path:
+        capture = response["result"]["capture"]
+        if not isinstance(capture, dict):
+            raise BevyFeedbackError(f"capture response missing metadata: {response}")
+        path = capture.get("path")
+        if not isinstance(path, str):
+            raise BevyFeedbackError(f"capture response missing path: {response}")
+        self._retain_capture_info(capture)
+        if self.last_capture is None:
+            raise BevyFeedbackError(f"capture response missing path: {response}")
+        return self.last_capture
+
     def _with_last_capture(self, message: str) -> str:
-        if self._last_capture:
-            return f"{message}; last captured frame: {self._last_capture}"
+        if self.last_capture:
+            return f"{message}; last captured frame: {self.last_capture}"
         return message
 
     def _read_protocol(self) -> dict[str, Any]:
@@ -423,26 +841,260 @@ class BevyFeedbackClient:
         return protocol
 
 
-def pixel_diff(a: str | os.PathLike[str], b: str | os.PathLike[str], region: tuple[int, int, int, int] | None = None) -> int:
+def _protocol_positive_int(
+    protocol: dict[str, Any], key: str, default: int, required: bool
+) -> int:
+    if key not in protocol:
+        if required:
+            raise BevyFeedbackError(f"protocol missing required advertised cap {key!r}")
+        return default
+    return _positive_int(key, protocol[key])
+
+
+def _protocol_positive_float(
+    protocol: dict[str, Any], key: str, default: float, required: bool
+) -> float:
+    if key not in protocol:
+        if required:
+            raise BevyFeedbackError(f"protocol missing required advertised cap {key!r}")
+        return default
+    return _positive_seconds(key, protocol[key])
+
+
+def _protocol_bool(
+    protocol: dict[str, Any], key: str, default: bool, required: bool
+) -> bool:
+    if key not in protocol:
+        if required:
+            raise BevyFeedbackError(f"protocol missing required advertised field {key!r}")
+        return default
+    value = protocol[key]
+    if not isinstance(value, bool):
+        raise BevyFeedbackError(f"protocol field {key!r} must be a boolean")
+    return value
+
+
+def _positive_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise BevyFeedbackError(f"{name} must be a positive integer")
+    return value
+
+
+def _bounded_frames(name: str, value: Any, cap: int) -> int:
+    value = _positive_int(name, value)
+    if value > cap:
+        raise BevyFeedbackError(f"{name} must not exceed advertised max_wait_frames {cap}")
+    return value
+
+
+def _positive_seconds(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BevyFeedbackError(f"{name} must be a finite positive number")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise BevyFeedbackError(f"{name} must be a finite positive number")
+    return value
+
+
+def _duration_nanoseconds(name: str, value: Any) -> int:
+    value = _positive_seconds(name, value)
+    try:
+        nanoseconds = int(
+            (Decimal(str(value)) * NANOSECONDS_PER_SECOND).to_integral_value(
+                rounding=ROUND_HALF_EVEN
+            )
+        )
+    except (InvalidOperation, ValueError) as error:
+        raise BevyFeedbackError(f"{name} cannot be converted to nanoseconds") from error
+    if nanoseconds <= 0:
+        raise BevyFeedbackError(f"{name} must be at least one nanosecond")
+    return nanoseconds
+
+
+def _selector(target: dict[str, str]) -> dict[str, str]:
+    if not isinstance(target, dict):
+        raise BevyFeedbackError("target must be a selector mapping")
+    keys = ("name", "accessibility_label", "marker")
+    selected = [key for key in keys if key in target]
+    if len(selected) != 1 or len(target) != 1:
+        raise BevyFeedbackError(
+            "target must contain exactly one of name, accessibility_label, or marker"
+        )
+    value = target[selected[0]]
+    if not isinstance(value, str) or not value:
+        raise BevyFeedbackError("target selector value must be a nonempty string")
+    return {selected[0]: value}
+
+
+def _target_request(
+    command: str,
+    target: dict[str, str],
+    kind: str | None,
+    camera: str | None,
+) -> dict[str, Any]:
+    if kind is not None and kind not in ("any", "ui", "world"):
+        raise BevyFeedbackError("kind must be 'any', 'ui', or 'world'")
+    request: dict[str, Any] = {
+        "command": command,
+        "target": _selector(target),
+    }
+    if kind is not None:
+        request["kind"] = kind
+    if camera is not None:
+        request["camera"] = camera
+    return request
+
+
+def _target_predicate(
+    predicate_type: str,
+    target: dict[str, str],
+    kind: str | None,
+    camera: str | None,
+) -> dict[str, Any]:
+    predicate = _target_request(predicate_type, target, kind, camera)
+    predicate["type"] = predicate.pop("command")
+    return predicate
+
+
+def _marker_predicate(
+    marker: str, min_count: int | None, max_count: int | None
+) -> dict[str, Any]:
+    if min_count is None and max_count is None:
+        raise BevyFeedbackError("marker count requires min_count or max_count")
+    predicate: dict[str, Any] = {"type": "marker_count", "marker": marker}
+    if min_count is not None:
+        predicate["min"] = _nonnegative_int("min_count", min_count)
+    if max_count is not None:
+        predicate["max"] = _nonnegative_int("max_count", max_count)
+    if min_count is not None and max_count is not None and min_count > max_count:
+        raise BevyFeedbackError("min_count must not exceed max_count")
+    return predicate
+
+
+def _nonnegative_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BevyFeedbackError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _bounded_attempts(value: Any) -> int:
+    value = _positive_int("attempts", value)
+    if value > MAX_CLIENT_CHUNKS:
+        raise BevyFeedbackError(
+            f"attempts must not exceed client bound {MAX_CLIENT_CHUNKS}"
+        )
+    return value
+
+
+def _response_details(response: dict[str, Any]) -> dict[str, Any]:
+    result = response.get("result")
+    details = result.get("details") if isinstance(result, dict) else None
+    if not isinstance(details, dict):
+        raise BevyFeedbackError(f"response missing diagnostic details: {response}")
+    return details
+
+
+def pixel_diff(
+    a: str | os.PathLike[str],
+    b: str | os.PathLike[str],
+    region: tuple[int, int, int, int] | None = None,
+    *,
+    include: tuple[int, int, int, int] | None = None,
+    masks: Sequence[tuple[int, int, int, int]] = (),
+) -> int:
+    """Count differing physical PNG pixels, optionally inside an include and outside masks."""
+    if region is not None and include is not None:
+        raise BevyFeedbackError("pixel_diff accepts either region or include, not both")
+    include = include if include is not None else region
+    masks = _bounded_masks(masks)
     try:
         from PIL import Image
     except ImportError as error:
         raise BevyFeedbackError("Pillow is required for image assertions") from error
     image_a = Image.open(a).convert("RGBA")
     image_b = Image.open(b).convert("RGBA")
+    scan_a, masks_a = _validate_pixel_regions(image_a.width, image_a.height, include, masks)
+    _validate_pixel_regions(image_b.width, image_b.height, include, masks)
     if image_a.size != image_b.size:
-        raise BevyFeedbackError(f"image dimensions differ: {image_a.size} vs {image_b.size} (window resized; wait_until_stable + re-capture)")
-    x, y, width, height = region or (0, 0, image_a.width, image_a.height)
+        raise BevyFeedbackError(
+            f"image dimensions differ: {image_a.size} vs {image_b.size} "
+            "(window resized; wait_until_stable + re-capture)"
+        )
+    x, y, width, height = scan_a
     changed = 0
     for py in range(y, y + height):
         for px in range(x, x + width):
-            changed += image_a.getpixel((px, py)) != image_b.getpixel((px, py))
+            masked = False
+            for mx, my, mask_width, mask_height in masks_a:
+                if mx <= px < mx + mask_width and my <= py < my + mask_height:
+                    masked = True
+                    break
+            if not masked:
+                changed += image_a.getpixel((px, py)) != image_b.getpixel((px, py))
     return changed
 
 
-def region_diff(a: str | os.PathLike[str], b: str | os.PathLike[str], region: tuple[int, int, int, int]) -> int:
-    """Count differing pixels inside a region."""
-    return pixel_diff(a, b, region)
+def region_diff(
+    a: str | os.PathLike[str],
+    b: str | os.PathLike[str],
+    region: tuple[int, int, int, int],
+    *,
+    masks: Sequence[tuple[int, int, int, int]] = (),
+) -> int:
+    """Count differing physical PNG pixels inside a region and outside masks."""
+    return pixel_diff(a, b, include=region, masks=masks)
+
+
+def _bounded_masks(
+    masks: Sequence[tuple[int, int, int, int]],
+) -> tuple[tuple[int, int, int, int], ...]:
+    if not isinstance(masks, Sequence) or isinstance(masks, (str, bytes)):
+        raise BevyFeedbackError("masks must be a sequence of rectangle tuples")
+    count = len(masks)
+    if count > 8:
+        raise BevyFeedbackError(f"at most 8 mask rectangles are allowed, got {count}")
+    return tuple(masks[index] for index in range(count))
+
+
+def _validate_pixel_regions(
+    image_width: int,
+    image_height: int,
+    include: tuple[int, int, int, int] | None,
+    masks: tuple[tuple[int, int, int, int], ...],
+) -> tuple[tuple[int, int, int, int], tuple[tuple[int, int, int, int], ...]]:
+    scan = _validate_pixel_region(
+        include if include is not None else (0, 0, image_width, image_height),
+        image_width,
+        image_height,
+        "include",
+    )
+    validated_masks = tuple(
+        _validate_pixel_region(mask, image_width, image_height, f"mask[{index}]")
+        for index, mask in enumerate(masks)
+    )
+    return scan, validated_masks
+
+
+def _validate_pixel_region(
+    region: tuple[int, int, int, int],
+    image_width: int,
+    image_height: int,
+    name: str,
+) -> tuple[int, int, int, int]:
+    if not isinstance(region, tuple) or len(region) != 4:
+        raise BevyFeedbackError(f"{name} must be a 4-integer tuple, got {region!r}")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in region):
+        raise BevyFeedbackError(f"{name} must be a 4-integer tuple, got {region!r}")
+    x, y, width, height = region
+    if x < 0 or y < 0:
+        raise BevyFeedbackError(f"{name} origin must be nonnegative, got {region!r}")
+    if width <= 0 or height <= 0:
+        raise BevyFeedbackError(f"{name} dimensions must be nonzero, got {region!r}")
+    if x > image_width or width > image_width - x or y > image_height or height > image_height - y:
+        raise BevyFeedbackError(
+            f"{name} {region!r} is out of bounds for image {image_width}x{image_height}"
+        )
+    return region
 
 
 def image_has_color(

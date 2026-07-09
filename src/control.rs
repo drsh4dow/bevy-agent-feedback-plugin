@@ -16,25 +16,36 @@ use bevy::{
         touch::TouchPhase,
     },
     prelude::*,
-    render::view::window::screenshot::{Screenshot, ScreenshotCaptured},
     window::{CursorMoved, FileDragAndDrop, Ime, PrimaryWindow},
 };
 use serde_json::Value;
 use std::{
     collections::VecDeque,
-    fs, io,
-    path::{Path, PathBuf},
     sync::{
         atomic::Ordering,
         mpsc::{SyncSender, TryRecvError},
     },
 };
 
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AgentFeedbackSet {
+    RequestAdmission,
+    DiagnosticEvaluation,
+    ResolvedInputInjection,
+}
+
 pub(crate) struct AgentFeedbackControlPlugin;
 
 impl Plugin for AgentFeedbackControlPlugin {
     fn build(&self, app: &mut App) {
+        let deterministic_time = app
+            .world()
+            .resource::<AgentFeedbackConfig>()
+            .deterministic_time;
+        let timing_control = timing::TimingControl::configure(app, deterministic_time);
         app.init_resource::<AgentFeedbackState>()
+            .init_resource::<capture::CaptureControl>()
+            .insert_resource(timing_control)
             .add_message::<CursorMoved>()
             .add_message::<FileDragAndDrop>()
             .add_message::<Ime>()
@@ -43,47 +54,61 @@ impl Plugin for AgentFeedbackControlPlugin {
             .add_message::<MouseMotion>()
             .add_message::<MouseWheel>()
             .add_message::<AppExit>()
+            .configure_sets(
+                PreUpdate,
+                (
+                    AgentFeedbackSet::RequestAdmission,
+                    AgentFeedbackSet::DiagnosticEvaluation,
+                    AgentFeedbackSet::ResolvedInputInjection,
+                )
+                    .chain()
+                    .before(bevy::input::InputSystems),
+            )
+            .add_systems(
+                First,
+                timing::guard_time_advance.before(bevy::time::TimeSystems),
+            )
             .add_systems(
                 PreUpdate,
                 (
                     begin_agent_frame,
                     release_disconnected_inputs,
                     tick_pending_actions,
-                    tick_pending_waits,
+                    capture::tick_pending,
+                    timing::tick_waits,
                     drain_agent_requests,
+                    timing::admit_timing_requests,
                     crate::runtime::idle_shutdown,
                 )
                     .chain()
-                    .before(bevy::input::InputSystems),
-            );
+                    .in_set(AgentFeedbackSet::RequestAdmission),
+            )
+            .add_systems(Last, timing::account_time_advance);
+        #[cfg(feature = "diagnostics")]
+        app.add_systems(
+            PreUpdate,
+            inject_resolved_clicks.in_set(AgentFeedbackSet::ResolvedInputInjection),
+        );
     }
 }
 
 #[derive(Resource, Default)]
-struct AgentFeedbackState {
-    frame: u64,
-    game_time_secs: f64,
-    next_capture: u64,
-    latest_capture: Option<CaptureInfo>,
-    pending_waits: VecDeque<PendingWait>,
+pub(crate) struct AgentFeedbackState {
+    pub(crate) frame: u64,
+    pub(crate) game_time_secs: f64,
+    pub(crate) latest_capture: Option<CaptureInfo>,
     pending_actions: VecDeque<PendingAction>,
-    captures: VecDeque<PathBuf>,
-    held_keys: Vec<KeyCode>,
-    held_buttons: Vec<MouseButton>,
-    cursor_position: Option<Vec2>,
+    pub(crate) held_keys: Vec<KeyCode>,
+    pub(crate) held_buttons: Vec<MouseButton>,
+    pub(crate) cursor_position: Option<Vec2>,
     last_heartbeat_unix_ms: u128,
-}
-
-struct PendingWait {
-    id: Value,
-    frames_left: u16,
-    responder: SyncSender<AgentResponse>,
 }
 
 struct PendingAction {
     id: Value,
     frames_left: u16,
     responder: SyncSender<AgentResponse>,
+    details: Option<Value>,
     kind: PendingActionKind,
 }
 
@@ -176,28 +201,6 @@ fn tick_pending_actions(
     }
 }
 
-fn tick_pending_waits(mut state: ResMut<AgentFeedbackState>) {
-    let latest_capture = state.latest_capture.clone();
-    let count = state.pending_waits.len();
-    for _ in 0..count {
-        let Some(mut wait) = state.pending_waits.pop_front() else {
-            return;
-        };
-        wait.frames_left = wait.frames_left.saturating_sub(1);
-        if wait.frames_left > 0 {
-            state.pending_waits.push_back(wait);
-            continue;
-        }
-
-        let _ = wait.responder.send(AgentResponse::ok(
-            wait.id,
-            "waited",
-            latest_capture.clone(),
-            None,
-        ));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn drain_agent_requests(
     mut commands: Commands,
@@ -217,6 +220,10 @@ fn drain_agent_requests(
     #[cfg(feature = "diagnostics")] mut diagnostics: Option<
         ResMut<crate::diagnostics::AgentDiagnosticsQueue>,
     >,
+    mut controls: ParamSet<(
+        ResMut<timing::TimingControl>,
+        ResMut<capture::CaptureControl>,
+    )>,
 ) {
     let Some(mut runtime) = runtime else {
         return;
@@ -244,6 +251,7 @@ fn drain_agent_requests(
             id,
             command,
             responder,
+            canceled,
         } = request;
         let accepted = match command {
             AgentCommand::KeyDown(key) => {
@@ -400,31 +408,29 @@ fn drain_agent_requests(
                     false
                 }
             },
-            AgentCommand::Wait { frames } => {
-                if state.pending_waits.len() >= command_limit {
-                    let _ = responder.send(AgentResponse::error(
-                        id,
-                        "queue_full",
-                        "too many pending wait commands",
-                    ));
-                    false
-                } else {
-                    state.pending_waits.push_back(PendingWait {
-                        id,
-                        frames_left: frames,
-                        responder,
-                    });
-                    true
-                }
-            }
-            AgentCommand::Capture { label } => capture_primary_window(
+            command @ (AgentCommand::Wait { .. }
+            | AgentCommand::WaitSeconds { .. }
+            | AgentCommand::AdvanceTime { .. }) => controls.p0().enqueue(
+                AgentRequest {
+                    id,
+                    command,
+                    responder,
+                    canceled,
+                },
+                command_limit,
+            ),
+            AgentCommand::Capture { label } => controls.p1().admit(
                 &mut commands,
                 &config,
-                &mut state,
+                &state,
                 &mut windows,
-                id,
-                responder,
-                label,
+                capture::CaptureRequest {
+                    id,
+                    responder,
+                    canceled,
+                    frames: 0,
+                    label,
+                },
             ),
             AgentCommand::ReleaseAllInputs => match release_all_inputs_internal(
                 &mut windows,
@@ -482,6 +488,7 @@ fn drain_agent_requests(
                                 id,
                                 frames_left: frames,
                                 responder,
+                                details: None,
                                 kind: PendingActionKind::ReleaseButton(button),
                             });
                             true
@@ -524,6 +531,7 @@ fn drain_agent_requests(
                                 id,
                                 frames_left: frames,
                                 responder,
+                                details: None,
                                 kind: PendingActionKind::Drag {
                                     from,
                                     to,
@@ -559,6 +567,7 @@ fn drain_agent_requests(
                                 id,
                                 frames_left: frames,
                                 responder,
+                                details: None,
                                 kind: PendingActionKind::ReleaseKey(key),
                             });
                             true
@@ -570,7 +579,25 @@ fn drain_agent_requests(
                     }
                 }
             }
-            AgentCommand::EcsSummary
+            AgentCommand::CaptureAfterFrames { frames, label } => controls.p1().admit(
+                &mut commands,
+                &config,
+                &state,
+                &mut windows,
+                capture::CaptureRequest {
+                    id,
+                    responder,
+                    canceled,
+                    frames,
+                    label,
+                },
+            ),
+            AgentCommand::TargetInfo { .. }
+            | AgentCommand::ClickTarget { .. }
+            | AgentCommand::ResourceInfo { .. }
+            | AgentCommand::EvaluatePredicate { .. }
+            | AgentCommand::WaitFor { .. }
+            | AgentCommand::EcsSummary
             | AgentCommand::ListEntities
             | AgentCommand::CameraInfo
             | AgentCommand::StateInfo
@@ -583,6 +610,7 @@ fn drain_agent_requests(
                                 id,
                                 command,
                                 responder,
+                                canceled,
                             },
                             command_limit,
                         )
@@ -604,10 +632,63 @@ fn drain_agent_requests(
     }
 }
 
+#[cfg(feature = "diagnostics")]
+fn inject_resolved_clicks(
+    config: Res<AgentFeedbackConfig>,
+    diagnostics: Option<ResMut<crate::diagnostics::AgentDiagnosticsQueue>>,
+    mut state: ResMut<AgentFeedbackState>,
+    mut windows: Query<(Entity, &mut Window), With<PrimaryWindow>>,
+    mut cursor_moved: MessageWriter<CursorMoved>,
+    mut mouse_button_input: MessageWriter<MouseButtonInput>,
+) {
+    let Some(mut diagnostics) = diagnostics else {
+        return;
+    };
+    let limit = diagnostics
+        .capacity()
+        .min(config.max_pending_commands.max(1));
+    for _ in 0..limit {
+        let Some(click) = diagnostics.pop_resolved_click() else {
+            break;
+        };
+        if click.canceled.load(Ordering::Relaxed) {
+            continue;
+        }
+        if state.pending_actions.len() >= config.max_pending_commands.max(1) {
+            queue_full(click.responder, click.id, "too many pending actions");
+            continue;
+        }
+        if let Err(error) =
+            move_cursor_internal(&mut windows, &mut cursor_moved, &mut state, click.position)
+        {
+            let _ = click.responder.send(error_response(click.id, error));
+            continue;
+        }
+        match write_mouse_button(
+            &mut windows,
+            &mut mouse_button_input,
+            click.button,
+            ButtonState::Pressed,
+            &mut state,
+        ) {
+            Ok(_) => state.pending_actions.push_back(PendingAction {
+                id: click.id,
+                frames_left: click.frames,
+                responder: click.responder,
+                details: Some(click.details),
+                kind: PendingActionKind::ReleaseButton(click.button),
+            }),
+            Err(()) => missing_window(click.responder, click.id),
+        }
+    }
+}
+
+mod capture;
 mod commands;
+mod timing;
 use commands::{
-    PendingActionResult, capture_primary_window, diagnostics_unavailable, error_response,
-    missing_window, move_cursor, move_cursor_internal, ok, ok_with_window, primary_window_info,
-    queue_full, release_all_inputs_internal, run_pending_action, validate_cursor_position,
+    PendingActionResult, diagnostics_unavailable, error_response, missing_window, move_cursor,
+    move_cursor_internal, ok, ok_with_window, primary_window_info, queue_full,
+    release_all_inputs_internal, run_pending_action, validate_cursor_position,
     write_file_drag_drop, write_keyboard, write_mouse_button,
 };

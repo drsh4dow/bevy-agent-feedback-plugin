@@ -3,6 +3,7 @@
 #[cfg(test)]
 use crate::session::PROTOCOL_VERSION;
 use crate::session::unix_ms;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -63,8 +64,51 @@ impl Default for OcrOptions {
     }
 }
 
+/// Completion state for a captured PNG.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureCompletion {
+    /// Bevy emitted `ScreenshotCaptured` after render readback.
+    ScreenshotCaptured,
+}
+
+/// Stable primary-window mode recorded with a capture.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureWindowMode {
+    /// A regular window.
+    Windowed,
+    /// Borderless fullscreen.
+    BorderlessFullscreen,
+    /// Exclusive fullscreen.
+    Fullscreen,
+}
+
+/// Primary-window metadata recorded at capture request or completion time.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CaptureWindowInfo {
+    /// Logical width used by input coordinates.
+    pub logical_width: f32,
+    /// Logical height used by input coordinates.
+    pub logical_height: f32,
+    /// Physical width in PNG pixels.
+    pub physical_width: u32,
+    /// Physical height in PNG pixels.
+    pub physical_height: u32,
+    /// Physical-to-logical scale factor.
+    pub scale_factor: f32,
+    /// Logical cursor position, when available.
+    pub cursor_position: Option<[f32; 2]>,
+    /// Whether the window was focused.
+    pub focused: bool,
+    /// Whether the window was visible.
+    pub visible: bool,
+    /// Window presentation mode.
+    pub mode: CaptureWindowMode,
+}
+
 /// A captured PNG returned by the plugin.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Capture {
     /// Monotonic capture sequence number.
     pub sequence: u64,
@@ -72,6 +116,20 @@ pub struct Capture {
     pub path: PathBuf,
     /// Optional capture label echoed by the plugin.
     pub label: Option<String>,
+    /// Plugin app-update counter when the request was admitted.
+    pub requested_frame: u64,
+    /// Plugin app-update counter when render readback completed.
+    pub completed_frame: u64,
+    /// Captured PNG width in physical pixels.
+    pub image_width: u32,
+    /// Captured PNG height in physical pixels.
+    pub image_height: u32,
+    /// Primary-window metadata retained from request admission.
+    pub window_at_request: CaptureWindowInfo,
+    /// Primary-window metadata at completion, if the window still existed.
+    pub window_at_completion: Option<CaptureWindowInfo>,
+    /// Typed render-readback completion state.
+    pub completion: CaptureCompletion,
 }
 
 /// Pixel-space rectangle used by image assertions.
@@ -94,9 +152,13 @@ pub struct AgentClient {
     next_id: u64,
     timeout: Duration,
     transcript: Option<File>,
-    last_capture: Option<PathBuf>,
+    last_capture: Option<Capture>,
     ocr: OcrOptions,
     max_wait_frames: u16,
+    deterministic_time: bool,
+    max_time_advance_steps: u16,
+    max_time_advance: Duration,
+    last_observation: Option<ObservedPredicate>,
 }
 
 /// Client failure.
@@ -114,6 +176,8 @@ pub enum ClientError {
         code: String,
         /// Human-readable error message.
         message: String,
+        /// Bounded structured context supplied by the game.
+        context: Option<Value>,
     },
     /// OCR is not available or the requested language is missing.
     OcrUnavailable(String),
@@ -132,8 +196,16 @@ impl Display for ClientError {
             | Self::OcrUnavailable(message)
             | Self::Ocr(message)
             | Self::Assertion(message) => formatter.write_str(message),
-            Self::Command { code, message } => {
-                write!(formatter, "command failed [{code}]: {message}")
+            Self::Command {
+                code,
+                message,
+                context,
+            } => {
+                write!(formatter, "command failed [{code}]: {message}")?;
+                if let Some(context) = context {
+                    write!(formatter, "; context={context}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -165,6 +237,27 @@ impl AgentClient {
     /// Connects using explicit configuration.
     pub fn with_config(config: AgentClientConfig) -> Result<Self, ClientError> {
         let protocol = read_protocol(&config.protocol_file)?;
+        if protocol.max_wait_frames == 0 {
+            return Err(ClientError::Protocol(
+                "protocol advertises zero max_wait_frames".to_string(),
+            ));
+        }
+        if protocol.max_time_advance_steps == 0 {
+            return Err(ClientError::Protocol(
+                "protocol advertises zero max_time_advance_steps".to_string(),
+            ));
+        }
+        let max_time_advance = Duration::try_from_secs_f64(protocol.max_time_advance_seconds)
+            .map_err(|_| {
+                ClientError::Protocol(
+                    "protocol max_time_advance_seconds must be finite and positive".to_string(),
+                )
+            })?;
+        if max_time_advance.is_zero() {
+            return Err(ClientError::Protocol(
+                "protocol advertises zero max_time_advance_seconds".to_string(),
+            ));
+        }
         let stream = TcpStream::connect_timeout(&protocol.socket_addr, config.timeout)
             .map_err(|error| socket_error(error, &protocol.socket_addr))?;
         stream.set_read_timeout(Some(config.timeout))?;
@@ -189,7 +282,11 @@ impl AgentClient {
             transcript,
             last_capture: None,
             ocr: config.ocr,
-            max_wait_frames: protocol.max_wait_frames.max(1),
+            max_wait_frames: protocol.max_wait_frames,
+            deterministic_time: protocol.deterministic_time,
+            max_time_advance_steps: protocol.max_time_advance_steps,
+            max_time_advance,
+            last_observation: None,
         })
     }
 
@@ -234,6 +331,7 @@ impl AgentClient {
             writeln!(transcript)?;
             transcript.flush()?;
         }
+        self.record_response_context(&response);
         if response["ok"] == Value::Bool(true) {
             return Ok(response);
         }
@@ -248,7 +346,12 @@ impl AgentClient {
         if code == "timeout" {
             message = self.with_last_capture(message);
         }
-        Err(ClientError::Command { code, message })
+        let context = response["error"].get("context").cloned();
+        Err(ClientError::Command {
+            code,
+            message,
+            context,
+        })
     }
 
     /// Replays request-only or transcript-envelope JSON-lines from disk.
@@ -272,42 +375,6 @@ impl AgentClient {
     /// Queries primary-window metadata.
     pub fn window_info(&mut self) -> Result<Value, ClientError> {
         self.request(json!({"command": "window_info"}))
-    }
-
-    /// Captures the primary window as a PNG.
-    pub fn capture(&mut self) -> Result<Capture, ClientError> {
-        self.capture_with_label(None)
-    }
-
-    /// Captures the primary window as a labeled PNG.
-    pub fn capture_labeled(&mut self, label: &str) -> Result<Capture, ClientError> {
-        self.capture_with_label(Some(label))
-    }
-
-    fn capture_with_label(&mut self, label: Option<&str>) -> Result<Capture, ClientError> {
-        let response = match label {
-            Some(label) => self.request(json!({"command": "capture", "label": label}))?,
-            None => self.request(json!({"command": "capture"}))?,
-        };
-        let capture = capture_from_response(&response)?;
-        self.last_capture = Some(capture.path.clone());
-        Ok(capture)
-    }
-
-    /// Waits for `frames` Bevy frames, chunking requests above the server cap.
-    pub fn wait(&mut self, frames: u16) -> Result<Value, ClientError> {
-        let cap = self.max_wait_frames;
-        if frames <= cap {
-            return self.request(json!({"command": "wait", "frames": frames}));
-        }
-        let mut response = Value::Null;
-        let mut remaining = frames;
-        while remaining > 0 {
-            let step = remaining.min(cap);
-            response = self.request(json!({"command": "wait", "frames": step}))?;
-            remaining -= step;
-        }
-        Ok(response)
     }
 
     /// Moves the cursor in logical window coordinates.
@@ -384,6 +451,26 @@ impl AgentClient {
         self.request(json!({"command": "shutdown"}))
     }
 
+    fn record_response_context(&mut self, response: &Value) {
+        let capture_value = response["result"]
+            .get("capture")
+            .or_else(|| response["result"].get("latest_capture"))
+            .or_else(|| response["error"]["context"].get("latest_capture"));
+        if let Some(capture) =
+            capture_value.and_then(|value| serde_json::from_value::<Capture>(value.clone()).ok())
+        {
+            self.last_capture = Some(capture);
+        }
+
+        let observation_value = response["result"]
+            .get("details")
+            .or_else(|| response["error"]["context"].get("observed_predicate"));
+        if let Some(observation) = observation_value
+            .and_then(|value| serde_json::from_value::<ObservedPredicate>(value.clone()).ok())
+        {
+            self.last_observation = Some(observation);
+        }
+    }
     fn read_error(&self, error: io::Error) -> ClientError {
         if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock {
             ClientError::Io(self.with_last_capture(format!(
@@ -397,221 +484,9 @@ impl AgentClient {
 
     fn with_last_capture(&self, message: String) -> String {
         match &self.last_capture {
-            Some(path) => format!("{message}; last captured frame: {}", path.display()),
+            Some(capture) => format!("{message}; last captured frame: {}", capture.path.display()),
             None => message,
         }
-    }
-
-    /// Counts differing pixels across two equally-sized images.
-    pub fn pixel_diff(a: impl AsRef<Path>, b: impl AsRef<Path>) -> Result<u64, ClientError> {
-        let a = image::ImageReader::open(a)?.decode().map_err(image_error)?;
-        let b = image::ImageReader::open(b)?.decode().map_err(image_error)?;
-        diff_images(&a, &b, None)
-    }
-
-    /// Counts differing pixels inside a region across two equally-sized images.
-    pub fn region_diff(
-        a: impl AsRef<Path>,
-        b: impl AsRef<Path>,
-        region: Region,
-    ) -> Result<u64, ClientError> {
-        let a = image::ImageReader::open(a)?.decode().map_err(image_error)?;
-        let b = image::ImageReader::open(b)?.decode().map_err(image_error)?;
-        diff_images(&a, &b, Some(region))
-    }
-
-    /// Asserts that two screenshots differ by at least `min_pixels`.
-    pub fn assert_changed(
-        a: impl AsRef<Path>,
-        b: impl AsRef<Path>,
-        min_pixels: u64,
-    ) -> Result<(), ClientError> {
-        let changed = Self::pixel_diff(&a, &b)?;
-        if changed >= min_pixels {
-            return Ok(());
-        }
-        Err(ClientError::Assertion(format!(
-            "screenshots changed {changed} pixels, expected at least {min_pixels}: {} and {}",
-            a.as_ref().display(),
-            b.as_ref().display()
-        )))
-    }
-
-    /// Asserts that two screenshots differ by at least `min_pixels` inside `region`.
-    pub fn assert_region_changed(
-        a: impl AsRef<Path>,
-        b: impl AsRef<Path>,
-        region: Region,
-        min_pixels: u64,
-    ) -> Result<(), ClientError> {
-        let changed = Self::region_diff(&a, &b, region)?;
-        if changed >= min_pixels {
-            return Ok(());
-        }
-        Err(ClientError::Assertion(format!(
-            "region {:?} changed {changed} pixels, expected at least {min_pixels}: {} and {}",
-            region,
-            a.as_ref().display(),
-            b.as_ref().display()
-        )))
-    }
-
-    /// Asserts that a color appears at least `min_pixels` times.
-    pub fn assert_color_present(
-        path: impl AsRef<Path>,
-        color: [u8; 3],
-        region: Option<Region>,
-        tolerance: u8,
-        min_pixels: u64,
-    ) -> Result<(), ClientError> {
-        let found = color_pixel_count(path.as_ref(), color, region, tolerance)?;
-        if found >= min_pixels {
-            return Ok(());
-        }
-        Err(ClientError::Assertion(format!(
-            "color {:?} found {found} pixels, expected at least {min_pixels}: {}",
-            color,
-            path.as_ref().display()
-        )))
-    }
-
-    /// Captures until the screenshot differs from `before`.
-    pub fn wait_until_changed(
-        &mut self,
-        before: impl AsRef<Path>,
-        frames_per_poll: u16,
-        attempts: u16,
-    ) -> Result<Capture, ClientError> {
-        for _ in 0..attempts {
-            self.wait(frames_per_poll)?;
-            let capture = self.capture()?;
-            if Self::pixel_diff(before.as_ref(), &capture.path)? > 0 {
-                return Ok(capture);
-            }
-        }
-        Err(ClientError::Assertion(
-            "screenshot did not change".to_string(),
-        ))
-    }
-
-    /// Waits until `stable_polls` consecutive captures are pixel-identical; returns the last capture.
-    ///
-    /// Use after boot instead of `wait_until_changed`: a settled static screen
-    /// passes immediately instead of burning the full attempts budget.
-    pub fn wait_until_stable(
-        &mut self,
-        frames_per_poll: u16,
-        attempts: u16,
-        stable_polls: u16,
-    ) -> Result<Capture, ClientError> {
-        let stable_polls = stable_polls.max(1);
-        let mut previous = self.capture()?;
-        let mut streak = 0u16;
-        for _ in 0..attempts {
-            self.wait(frames_per_poll)?;
-            let current = self.capture()?;
-            let previous_dimensions = image::image_dimensions(&previous.path)
-                .map_err(|error| ClientError::Assertion(error.to_string()))?;
-            let current_dimensions = image::image_dimensions(&current.path)
-                .map_err(|error| ClientError::Assertion(error.to_string()))?;
-            let changed = if previous_dimensions == current_dimensions {
-                Self::pixel_diff(&previous.path, &current.path)?
-            } else {
-                1
-            };
-            if changed == 0 {
-                streak += 1;
-                if streak >= stable_polls {
-                    return Ok(current);
-                }
-            } else {
-                streak = 0;
-            }
-            previous = current;
-        }
-        Err(ClientError::Assertion(format!(
-            "screen did not stabilize after {attempts} polls"
-        )))
-    }
-
-    /// Captures until a color appears in a pixel region.
-    pub fn wait_until_color(
-        &mut self,
-        color: [u8; 3],
-        region: Region,
-        tolerance: u8,
-        frames_per_poll: u16,
-        attempts: u16,
-    ) -> Result<Capture, ClientError> {
-        for _ in 0..attempts {
-            self.wait(frames_per_poll)?;
-            let capture = self.capture()?;
-            if image_has_color(&capture.path, color, region, tolerance)? {
-                return Ok(capture);
-            }
-        }
-        Err(ClientError::Assertion("color did not appear".to_string()))
-    }
-
-    /// Runs Tesseract OCR on an image.
-    pub fn ocr_image(&self, path: impl AsRef<Path>) -> Result<String, ClientError> {
-        run_tesseract(&self.ocr, path.as_ref())
-    }
-
-    /// Crops a region and runs Tesseract OCR on it.
-    pub fn ocr_region(
-        &self,
-        path: impl AsRef<Path>,
-        region: Region,
-    ) -> Result<String, ClientError> {
-        let image = image::ImageReader::open(path)?
-            .decode()
-            .map_err(image_error)?;
-        validate_region(&image, region)?;
-        let cropped = image.crop_imm(region.x, region.y, region.width, region.height);
-        let temp = std::env::temp_dir().join(format!(
-            "bevy-feedback-ocr-{}-{}.png",
-            std::process::id(),
-            unix_ms()
-        ));
-        cropped.save(&temp).map_err(image_error)?;
-        let result = self.ocr_image(&temp);
-        let _ = fs::remove_file(temp);
-        result
-    }
-
-    /// Asserts that OCR output contains `expected`.
-    pub fn assert_text(&self, path: impl AsRef<Path>, expected: &str) -> Result<(), ClientError> {
-        let text = normalize_text(&self.ocr_image(path)?);
-        let expected = normalize_text(expected);
-        if text.contains(&expected) {
-            Ok(())
-        } else {
-            Err(ClientError::Assertion(format!(
-                "OCR text did not contain '{expected}': {text}"
-            )))
-        }
-    }
-
-    /// Captures until OCR output contains `expected`.
-    pub fn wait_until_text(
-        &mut self,
-        expected: &str,
-        frames_per_poll: u16,
-        attempts: u16,
-    ) -> Result<Capture, ClientError> {
-        for _ in 0..attempts {
-            self.wait(frames_per_poll)?;
-            let capture = self.capture()?;
-            match self.assert_text(&capture.path, expected) {
-                Ok(()) => return Ok(capture),
-                Err(ClientError::Assertion(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(ClientError::Assertion(format!(
-            "text '{expected}' did not appear"
-        )))
     }
 }
 
@@ -627,28 +502,22 @@ impl Drop for AgentClient {
 }
 
 fn capture_from_response(response: &Value) -> Result<Capture, ClientError> {
-    let capture = &response["result"]["capture"];
-    let sequence = capture["sequence"].as_u64().ok_or_else(|| {
-        ClientError::Protocol(format!("capture response missing sequence: {response}"))
-    })?;
-    let path = capture["path"].as_str().ok_or_else(|| {
-        ClientError::Protocol(format!("capture response missing path: {response}"))
-    })?;
-    let label = capture["label"].as_str().map(str::to_string);
-    Ok(Capture {
-        sequence,
-        path: PathBuf::from(path),
-        label,
+    serde_json::from_value(response["result"]["capture"].clone()).map_err(|error| {
+        ClientError::Protocol(format!("invalid capture metadata ({error}): {response}"))
     })
 }
 
 mod image_assertions;
-use image_assertions::{
-    color_pixel_count, diff_images, image_error, image_has_color, normalize_text, run_tesseract,
-    validate_region,
-};
+#[cfg(test)]
+use image_assertions::run_tesseract;
 mod protocol_file;
 use protocol_file::{read_protocol, socket_error};
+mod diagnostics;
+pub use diagnostics::{
+    ComparisonOperator, ObservedPredicate, Predicate, PredicateOutcome, ResolvedTargetKind,
+    TargetBounds, TargetInfo, TargetKind, TargetSelector,
+};
+mod timing;
 
 #[cfg(test)]
 mod tests;

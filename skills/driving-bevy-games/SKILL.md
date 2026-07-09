@@ -1,11 +1,19 @@
 ---
 name: driving-bevy-games
-description: Drive a running Bevy game through the bevy-agent-feedback-plugin socket — send input, capture screenshots, verify behavior from pixels. Use when the user wants to playtest or visually verify a Bevy app, or wants bevy-agent-feedback-plugin wired into a game.
+description: Drive and verify a running Bevy game through bevy-agent-feedback-plugin using semantic readiness, deterministic time, and completion-confirmed PNG captures.
 ---
+
+## Choose readiness by game type
+
+**Animated or interactive game:** wait for registered game state, resource, marker, or semantic target predicates, then call `capture_after_frames(1)`. The predicate proves game readiness; the one-frame delayed capture gives the ready state a render boundary and waits for screenshot readback.
+
+**Genuinely static scene or bounded static region:** `wait_until_stable` is a strict pixel-identical check. Scope it with `include`/`masks` when appropriate; do not use whole-screen stability for animation, particles, cursors, clocks, or video.
+
+`protocol ready != game ready`: the protocol file and socket prove only that automation can connect. Assets, menus, save data, cameras, and gameplay state may still be loading.
 
 ## First run
 
-1. Install and verify:
+Install and verify:
 
 ```sh
 cargo install bevy-agent-feedback-plugin
@@ -13,7 +21,7 @@ bevy-feedback --version
 bevy-feedback doctor
 ```
 
-2. Run game + driver:
+Run game and driver:
 
 ```sh
 bevy-feedback run --ready-timeout 180000 \
@@ -21,11 +29,11 @@ bevy-feedback run --ready-timeout 180000 \
   --driver python3 tests/drive_smoke.py
 ```
 
-`bevy-feedback run` and `doctor` inject the bundled Python client automatically; `PYTHONPATH` is not required. Set `PYTHONPATH` to this skill directory only when running a driver script by hand outside `bevy-feedback run`.
+`bevy-feedback run` injects the bundled `bevy_feedback` module. Manual drivers outside the wrapper need `PYTHONPATH=skills/driving-bevy-games`. The canonical source is `clients/python/bevy_feedback.py`; the skill copy is byte-identical.
 
-`protocol ready != game ready`: the socket exists; assets, menus, save data, and cameras may still be loading. Wait for a stable frame before acting.
+## Canonical animated workflow
 
-3. Copy-paste smoke driver:
+The registered keys below are exact short Rust type names (`AppState`, `RoundStats`, `Clickable`). Exact `Name`, accessibility-label, and marker selectors must resolve once: duplicates return `ambiguous_target`; clients never choose the first match.
 
 ```python
 import json
@@ -34,32 +42,53 @@ import bevy_feedback
 from bevy_feedback import BevyFeedbackClient, fail
 
 def main(game: BevyFeedbackClient) -> None:
-    ready = game.wait_until_stable(frames=15, attempts=40, label="boot")
-    game.click(*game.point(0.50, 0.50))  # click(x, y, button="Left"); point() maps fractions to logical pixels
-    game.wait(10)
-    before = game.capture(label="before_drag")
-    game.drag("Left", game.window_center(), game.point(0.90, 0.50), steps=30, frames=45)
-    game.wait(10)
-    after = game.capture(label="after_drag")
-    game.assert_changed(before, after, min_pixels=1)
-    if not Path(after).exists():
-        fail(f"missing final capture: {after}")
-    print(json.dumps({"boot": str(ready), "before_drag": str(before), "after_drag": str(after)}))
+    # Completion-confirmed first readable render.
+    first = game.wait_until_first_capture()
+
+    # Registered semantic readiness and bounded absence checks.
+    game.wait_for_state("AppState", "MainMenu", max_frames=300)
+    game.wait_for_resource("RoundStats", "loaded", "eq", True, max_frames=300)
+    game.wait_for_resource("RoundStats", "loading", "eq", False, max_frames=300)
+    game.wait_for_marker_present("Clickable", max_frames=300)
+    game.wait_for_marker_absent("LoadingSpinner", max_frames=300)
+    game.wait_for_target({"name": "Play"}, max_frames=300)
+    game.wait_for_target_absent({"name": "BlockingModal"}, max_frames=300)
+
+    game.click_named("Play")  # atomic resolve + click; no cached coordinates
+    game.wait_for_state("AppState", "Playing", max_frames=300)
+    ready = game.capture_after_frames(1, label="playing")
+
+    info = game.last_capture_info
+    if info is None or info["completion"] != "screenshot_captured":
+        fail(f"capture did not complete readback: {info}")
+    if not Path(ready).exists():
+        fail(f"missing capture: {ready}")
+    print(json.dumps({
+        "first": str(first),
+        "ready": str(ready),
+        "capture": info,  # sequence/path/label, frames, dimensions, windows, completion
+    }))
 
 bevy_feedback.run(main)
 ```
 
-4. Results: live PNGs are in the protocol file's `capture_dir`; after `bevy-feedback run`, use the printed `<artifacts>/screenshots/`. On failure, read `failure-summary.txt`, `game.log`, `driver.log`, `transcript.jsonl`.
+State waits support exact equality; waiting for the next state proves departure from the previous one. Resource comparisons support `eq|ne|lt|lte|gt|gte`; model absence as a registered boolean/nullable field. Markers and targets provide explicit present/absent waits. Do not invent a state-absence helper.
+
+Use `wait_frames(n)` only to count app updates—for input propagation or a render boundary. It is **not** elapsed gameplay time. Under normal time, `wait_seconds(seconds, max_frames=...)` observes Bevy virtual time without changing it. Frozen deterministic mode rejects `wait_seconds`; use `advance_time(seconds, step_seconds=...)`. Clients chunk deterministic advancement from advertised caps while preserving full nominal steps in non-final chunks and allowing only the final chunk to have a short remainder.
+
+After semantic readiness, prefer `capture_after_frames(1)` rather than a separate frame wait plus capture. `completion == "screenshot_captured"` proves Bevy emitted `ScreenshotCaptured` after render readback and that the PNG was persisted. It does **not** prove the OS/window compositor presented the image.
 
 ## Wire the game
 
 ```toml
 [dependencies]
-bevy-agent-feedback-plugin = { version = "0.3", optional = true, features = ["diagnostics"] }
+bevy-agent-feedback-plugin = { version = "0.4", optional = true, features = ["diagnostics"] }
 
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
 ```
+
+Add feedback after `DefaultPlugins` (or at least after Bevy `TimePlugin` plus window/render/input providers). Deterministic mode needs those time resources before plugin construction.
 
 ```rust
 #[cfg(feature = "agent")]
@@ -67,6 +96,7 @@ agent = ["dep:bevy-agent-feedback-plugin"]
     use bevy_agent_feedback_plugin::{
         AgentFeedbackConfig, AgentFeedbackDiagnosticsPlugin, AgentFeedbackPlugin,
     };
+
     app.add_plugins(AgentFeedbackPlugin::new(AgentFeedbackConfig {
         bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         protocol_file: std::env::var_os("BEVY_FEEDBACK_PROTOCOL")
@@ -75,74 +105,74 @@ agent = ["dep:bevy-agent-feedback-plugin"]
         capture_dir: std::env::var_os("BEVY_FEEDBACK_CAPTURE_DIR")
             .map(Into::into)
             .unwrap_or_else(|| "target/agent-feedback/captures".into()),
+        deterministic_time: true,
         ..Default::default()
     }));
     app.add_plugins(
         AgentFeedbackDiagnosticsPlugin::default()
-            // .with_state::<AppState>()
-            // .with_marker::<Selectable>()
+            .with_state::<AppState>()
+            .with_marker::<Clickable>()
+            .with_resource_field::<RoundStats, _, _>("loaded", |stats| stats.loaded),
     );
 }
 ```
 
-Use diagnostics only for ECS/state/marker queries. Done when `cargo check --features agent` passes.
+The `diagnostics` crate feature enables Bevy state/UI support (`bevy/bevy_state`, `bevy/bevy_ui`). Registration is explicit and bounded. Plain `AgentFeedbackPlugin` has no state, resource, marker, predicate, or target queries.
 
-## Readiness
+Deterministic mode freezes Bevy-managed virtual/fixed time between `advance_time` requests. It cannot control direct `Instant::now()`, OS or network clocks, unseeded RNG, external processes, or other external state. Do not claim repeatability unless those sources are controlled too.
 
-No diagnostics: pixels are truth. `wait_until_stable` settles boot; `wait_until_changed` verifies act→react (fails on an already-settled screen).
+## Inputs and visual fallback
 
-```python
-ready = game.wait_until_stable(frames=15, attempts=40, label="ready")
-game.click(*game.point(0.50, 0.50))
-changed = game.wait_until_changed(ready, frames=10, attempts=30, label="after_click")
-game.wait_until_color((255, 255, 255), (20, 20, 120, 40), tolerance=10, attempts=30, label="hud")
-```
+Prefer semantic target waits and `click_named`/`click_accessibility_label`/`click_marker`. Use coordinates only when no semantic registration exists.
 
-Diagnostics: recommended when waiting on Bevy states. Add `AgentFeedbackDiagnosticsPlugin::default().with_state::<AppState>()`, then poll `state_info`. Plain `AgentFeedbackPlugin` has no state query.
+- Input coordinates are **logical window pixels**, origin top-left.
+- PNG assertions, OCR crops, `include`, and `masks` use **physical PNG pixels**.
+- Convert with the capture's `window_at_request.scale_factor`; use `image_width`/`image_height`, and recompute after resize or scale-factor changes.
+- Masked-region checks are a focused fallback, not the primary readiness signal. Keep masks small: they can hide regressions.
+- `drag` defaults to `steps=10`, `frames=steps`; the established explicit long drag is `steps=30, frames=45`.
+- Wire `key_tap` and `key_hold` default to one app-update frame. Python `key_hold(key, frames)` requires the frame count. Frames still do not mean gameplay seconds.
+- Compound input auto-releases. Labeled captures use `[A-Za-z0-9_-]{1,40}`.
 
-## Assertions & inputs
-
-Use look → act → look. Trust a command only after a pixel/color/text/diagnostic check.
-Clicks work on unmodified idiomatic games as of this plugin version: synthetic input syncs `Window::cursor_position`.
-
-- Prefer `click`, `drag`, `scroll`, `key_tap`, `key_hold`; they auto-release.
-- `click(x, y, button="Left")` takes logical pixel coords; fractional: `game.click(*game.point(fx, fy))`. Button first fails: `invalid type: string "Left", expected f32`.
-- Coordinates are logical pixels, origin top-left. Use `window_center()` and `point(frac_x, frac_y)` for portable smoke tests.
-- Labeled captures use `[A-Za-z0-9_-]{1,40}` and produce `capture-000123-label.png`.
-- Use `fail("message")`; `bevy_feedback.run(main)` prints one-line JSON and hides expected game/client tracebacks.
-
-Exact window dimensions are only safe when the test owns the display environment (Xvfb/headless CI); local window managers override `WindowResolution`.
+Static-region fallback:
 
 ```python
-info = game.window_info()["result"]["window"]
-if (info["logical_width"], info["logical_height"], info["scale_factor"]) != (1280.0, 720.0, 1.0):
-    fail(f"unexpected window metrics: {info}")
+stable = game.wait_until_stable(
+    frames=10,
+    attempts=30,
+    stable=2,
+    include=(0, 0, 1280, 180),       # physical PNG pixels
+    masks=((1160, 0, 120, 80),),     # physical PNG pixels
+    label="static_hud",
+)
+game.drag("Left", game.window_center(), game.point(0.90, 0.50), steps=30, frames=45)
+game.key_tap("Enter")
+game.key_hold("KeyW", 45)
 ```
 
-## Manual mode / artifacts / cleanup / troubleshooting
+## Results, cleanup, troubleshooting
 
-```sh
-bevy-feedback run -- cargo run --features agent
-python3 .agents/skills/driving-bevy-games/drive.py "$BEVY_FEEDBACK_PROTOCOL" < commands.jsonl
-```
+Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<artifacts>/screenshots/`. Failures preserve bounded structured server context and latest capture metadata in `failure-summary.txt`/`transcript.jsonl`.
 
 | path | purpose |
 |---|---|
 | `game.log` / `driver.log` | stdout/stderr streams |
-| `protocol.json` | copied live protocol/session metadata |
-| `transcript.jsonl` | replayable request/response/timing envelopes |
-| `captures/` | wrapper-exported fallback live capture dir |
-| `screenshots/` | final copied PNGs from protocol `capture_dir` |
-| `failure-summary.txt` | failure reason, log tails, newest capture |
+| `protocol.json` | copied live protocol, advertised commands, timing mode, and caps |
+| `transcript.jsonl` | replayable request/response/timing envelopes and error context |
+| `captures/` | wrapper-exported fallback live capture directory |
+| `screenshots/` | final copied PNGs |
+| `failure-summary.txt` | failure reason, bounded diagnostic context, log tails, newest capture |
 
-The wrapper releases inputs and sends `shutdown`. Manual clients should send `release_all_inputs` and `shutdown`, or call `BevyFeedbackClient.close()`.
+The wrapper releases inputs and sends `shutdown`. Manual clients should call `BevyFeedbackClient.close()`.
 
 | symptom | fix |
 |---|---|
-| `protocol file not found` | start the game through `bevy-feedback run` |
-| readiness timeout | increase `--ready-timeout MS`; clean Bevy builds can exceed 60s |
-| stale protocol | stop old games; clients reject stale pid/heartbeat data |
-| `import bevy_feedback` fails | `bevy-feedback run` injects the bundled client; for manual scripts, set `PYTHONPATH` to the real skill directory |
-| no screenshots in artifacts | inspect `protocol.json.capture_dir`; wrapper copies that directory |
-| OCR errors | install Pillow for crops; install `tesseract` plus language data |
+| protocol ready but game not ready | wait on a registered predicate/target, then `capture_after_frames(1)` |
+| `time_control_frozen` | replace observational `wait_seconds` with `advance_time` |
+| semantic command unavailable | enable `diagnostics` and register the state/resource/marker |
+| ambiguous target | make exact Name/accessibility label/marker unique; never select the first candidate |
+| target search truncated | reduce ambiguity or expose a unique registered marker; absence was not proven |
+| image assertion misses | verify physical PNG dimensions/scale and recompute regions after resize |
+| no screenshots | inspect `protocol.json.capture_dir` and capture completion metadata |
 | no display/CI | use a real display, Wayland, or `xvfb-run -s '-screen 0 1280x720x24'` |
+
+Exact window dimensions are reliable only when the test owns the display environment. Window managers may override `WindowResolution`, and screenshot readback has window/display/compositor constraints.

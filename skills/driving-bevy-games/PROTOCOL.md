@@ -1,148 +1,137 @@
 # bevy-agent-feedback protocol v2 reference
 
-Command catalog and wire format for driving a Bevy app instrumented with
-`bevy-agent-feedback-plugin`. The running app's **protocol file is
-authoritative** — it embeds the live `commands`, `examples`, `coordinates`,
-socket, and limits. This file is the offline mirror plus response/error detail.
+Offline wire reference for `bevy-agent-feedback-plugin`. The running app's protocol file is authoritative: inspect its live `commands`, examples, timing mode, and caps rather than guessing.
 
-## Transport
+## Transport, discovery, and envelope
 
-- JSON-lines over TCP: one JSON object per line, one response line per request.
-- Single local client at a time; loopback only.
-- Request line limit: 8192 bytes (`line_too_long`).
+- JSON-lines over TCP, one object and one response per line; one loopback client.
+- Request line cap: 8192 bytes (`line_too_long`).
+- Request: `{"id":<any>,"command":"<name>",...}`; omitted IDs are assigned by clients.
+- Success: `{"id":..,"ok":true,"result":{...}}`.
+- Error: `{"id":..,"ok":false,"error":{"code":"..","message":"..","context":{...}}}`.
+- Malformed JSON uses `"id":null`; valid validation failures preserve the request ID.
 
-## Discovery — the protocol file
-
-Read the JSON file at `$BEVY_FEEDBACK_PROTOCOL` (default
-`target/agent-feedback/agent-feedback.json`). Fields:
+Protocol-file fields:
 
 | field | meaning |
 |---|---|
-| `protocol` | must equal `bevy-agent-feedback/2` |
-| `socket_addr` | `host:port` to connect |
-| `session_id`, `pid`, `started_at_unix_ms` | session identity |
-| `heartbeat_file`, `heartbeat_interval_ms`, `stale_after_ms` | liveness |
-| `capture_dir` | where `capture` writes PNGs |
-| `command_timeout_ms`, `max_action_steps`, `max_wait_frames` | limits (see below) |
-| `coordinates` | `logical window pixels, origin top-left` |
-| `commands`, `examples` | live command schema + sample requests |
+| `protocol` | exactly `bevy-agent-feedback/2` |
+| `socket_addr`, `session_id`, `pid`, `started_at_unix_ms` | endpoint and session identity |
+| `heartbeat_file`, `heartbeat_interval_ms`, `stale_after_ms` | liveness; PID and fresh heartbeat are both required |
+| `capture_dir` | persisted PNG directory |
+| `coordinates` | logical primary-window input pixels, origin top-left |
+| `deterministic_time` | whether Bevy virtual/fixed time is frozen between explicit advances |
+| `max_wait_frames`, `max_action_steps` | per-request app-update/action caps |
+| `max_time_advance_steps`, `max_time_advance_seconds` | deterministic per-request caps; defaults 600 and 10 seconds |
+| `command_timeout_ms` | default 10,000 ms |
+| `window_modes` | `windowed`, `borderless_fullscreen`, `fullscreen` |
+| `capture_completion` | `screenshot_captured` |
+| `commands`, `examples` | exact live schemas and requests |
 
-Reject the session as stale unless `pid` is alive **and** `heartbeat_file`
-holds a timestamp newer than `stale_after_ms`. The bundled clients enforce this.
+Other defaults: `max_wait_frames=300`, `max_action_steps=120`, retained captures `32`. Labels match `[A-Za-z0-9_-]{1,40}`. Timing durations must be finite, positive, and nonzero after conversion. Selector/state/resource/field/camera strings are 1..=128 bytes; diagnostic scalar strings are 1..=1024 bytes. All queues, scans, waits, actions, captures, and client chunks are bounded.
 
-## Request / response envelope
+## Coordinates and frame semantics
 
-Request: `{"id": <any>, "command": "<name>", ...params}`. `id` echoes back;
-clients auto-assign if omitted.
+Input (`cursor_move`, `click`, `drag`, semantic target centers) uses **logical window coordinates**. Capture image dimensions and image-helper `include`/`masks`/OCR regions use **physical PNG pixels**. Convert with capture `scale_factor`; recompute after a resize or scale-factor change.
 
-Success: `{"id":.., "ok":true, "result":{...}}`
-Error: `{"id":.., "ok":false, "error":{"code":.., "message":..}}` — malformed JSON returns `"id": null`; syntactically valid request validation errors preserve the request `id`.
+`frames` counts plugin **app updates**, not compositor-presented frames and not elapsed gameplay time. `wait_frames` is the public-client name; it emits the compatibility wire command `"wait"`. Bevy screenshot readback completion does not prove the OS/window compositor presented the frame.
 
-`result` may carry:
+## Exact lifecycle/timing/capture JSON
 
-- `status` — short string (`ok`, `captured`, `waited`, `released`, …).
-- `capture` / `latest_capture` — `{"sequence":u64, "path":"…png", "label?":"…"}`.
-- snapshot fields (flattened): `frame`, `game_time_secs`, `window`,
-  `mouse_position` `[x,y]`, `pressed_keys[]`, `pressed_buttons[]`.
-- `details` — diagnostics payload.
+```jsonl
+{"id":1,"command":"wait","frames":1}
+{"id":2,"command":"wait_seconds","seconds":0.5,"max_frames":300}
+{"id":3,"command":"advance_time","seconds":1.0,"step_seconds":0.016666667}
+{"id":4,"command":"capture","label":"now"}
+{"id":5,"command":"capture_after_frames","frames":1,"label":"ready"}
+{"id":6,"command":"window_info"}
+{"id":7,"command":"release_all_inputs"}
+{"id":8,"command":"shutdown"}
+```
 
-`mouse_position` is the agent logical cursor. `window`: `logical_width/height`,
-`physical_width/height`, `scale_factor`, optional OS-reported
-`cursor_position [x,y]`.
-
-### Error codes
-
-`invalid_request` (bad JSON / unknown or malformed command),
-`invalid_argument` (bad command parameter; capture labels must match
-`[A-Za-z0-9_-]{1,40}`), `line_too_long`, `queue_full`, `closed`, `timeout`,
-`missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`,
-`diagnostics_unavailable`, `socket_error`.
-
-`position_out_of_bounds` keeps code `position_out_of_bounds`; its message is
-`point [x,y] outside logical window WxH`.
-
-## Commands
-
-Coordinates are logical pixels, origin top-left. `frames` counts rendered
-frames. Held input (`key_down`, `mouse_down`) persists until released or
-`release_all_inputs`; compound actions auto-release.
-
-### Input primitives
-
-| command | params | notes |
-|---|---|---|
-| `key_down` / `key_up` | `key` | physical `KeyCode` name (below), case-insensitive |
-| `mouse_down` / `mouse_up` | `button` | `MouseButton` name, case-insensitive |
-| `cursor_move` | `x`, `y` | synthesize Bevy cursor movement to an agent logical position; also updates `Window::cursor_position`, so idiomatic `window.cursor_position()` game code sees agent input |
-| `mouse_motion` | `dx`, `dy` | raw motion delta |
-| `mouse_scroll` | `y`, `x?`=0, `unit?` | `unit`: `Line` (default) or `Pixel` |
-| `text` | `value` | UTF-8 committed via Bevy IME |
-| `file_hover` / `file_drop` | `path` | drag-and-drop file events |
-| `file_cancel` | — | cancel a hover |
-
-### Compound actions (safe; auto-release)
-
-| command | params | notes |
-|---|---|---|
-| `click` | `x`, `y`, `button?`=Left, `frames?`=1 | press+release over `frames`; also updates `Window::cursor_position` |
-| `drag` | `from`=[x,y], `to`=[x,y], `button?`=Left, `steps?`=10, `frames?`=steps | `frames` ≥ `steps`; `steps` ≤ `max_action_steps`; each move updates `Window::cursor_position` |
-| `scroll` | `lines`, `x?`=0, `unit?` | vertical line delta (wraps `mouse_scroll`) |
-| `key_tap` | `key`, `frames?`=1 | hold for `frames` then release |
-| `key_hold` | `key`, `frames?`=1 | hold for `frames` then release |
-| `release_all_inputs` | — | release every agent-held key/button |
-
-### Lifecycle / query
-
-| command | params | result |
-|---|---|---|
-| `window_info` | — | window + snapshot |
-| `wait` | `frames?`=1 | advance `frames` (1..=`max_wait_frames`); bundled clients chunk larger waits automatically |
-| `capture` | `label?` `[A-Za-z0-9_-]{1,40}` | write PNG; `capture.path`; filename includes `-label` when present |
-| `shutdown` | — | exit the app cleanly |
-
-### Diagnostics
-
-Require the plugin's `diagnostics` cargo feature **and**
-`AgentFeedbackDiagnosticsPlugin`; otherwise `diagnostics_unavailable`.
-
-| command | result (`details`) |
+| command | exact rules |
 |---|---|
-| `ecs_summary` | `entity_count`, optional `entity_count_is_lower_bound`, `component_count`, `archetype_count` |
-| `list_entities` | `entities:[{entity, components[]}]`, `total`, `truncated`, optional `total_is_lower_bound` (cap 256) |
-| `camera_info` | `cameras:[{entity, is_active, order, viewport, translation, projection}]`, `total`, `truncated`, optional `total_is_lower_bound` (cap 32) |
-| `state_info` | `states[]` — only types registered via `.with_state::<S>()` |
-| `marker_info` | `markers:[{name, count, entities[], truncated, count_is_lower_bound?}]` — only types registered via `.with_marker::<T>()` |
+| `wait` | `frames?=1`, 1..=`max_wait_frames`; compatibility wire name only |
+| `wait_seconds` | positive `seconds`; `max_frames?=max_wait_frames`; observes normal Bevy virtual time without changing it |
+| `advance_time` | positive `seconds` <= advertised cap; `step_seconds?` positive; default is `Time<Fixed>::timestep()` (normally 1/60); requires deterministic mode |
+| `capture` | optional valid `label`; waits for PNG readback/persistence |
+| `capture_after_frames` | required `frames` 1..=`max_wait_frames`, optional valid `label`; one ordered wait/capture operation |
 
-When `truncated` is true, `total`/`count`/`entity_count` may be a lower bound instead of an exact full-world scan. The corresponding `*_is_lower_bound` field is present only in that case.
+Frozen deterministic mode rejects `wait_seconds` with `time_control_frozen`; normal mode rejects `advance_time` with `time_control_disabled`. Deterministic advancement requires unpaused `Time<Virtual>`, relative speed 1, a nominal step no larger than `max_delta`, and no conflicting `TimeUpdateStrategy`. `ceil(seconds/step_seconds)` must fit `max_time_advance_steps`. Clients derive chunks only from advertised caps: every non-final chunk is an integer number of nominal steps; only the final total chunk may contain a short remainder. This preserves the Update delta sequence across cap changes.
 
-## Limits
+Determinism covers Bevy-managed virtual/fixed time only—not direct `Instant::now()`, OS/network clocks, unseeded RNG, external processes, or other external state.
 
-Config-driven; live values are in the protocol file. Defaults:
-`max_wait_frames` 300, `max_action_steps` 120, `command_timeout` 10s,
-retained captures 32 (older PNGs pruned).
+A `result.capture` (and `result.latest_capture`) metadata object has this exact shape:
 
-## Names
+```json
+{"sequence":5,"path":".../capture-000005-ready.png","label":"ready","requested_frame":40,"completed_frame":42,"image_width":1280,"image_height":720,"window_at_request":{"logical_width":1280.0,"logical_height":720.0,"physical_width":1280,"physical_height":720,"scale_factor":1.0,"cursor_position":[640.0,360.0],"focused":true,"visible":true,"mode":"windowed"},"window_at_completion":{"logical_width":1280.0,"logical_height":720.0,"physical_width":1280,"physical_height":720,"scale_factor":1.0,"cursor_position":[640.0,360.0],"focused":true,"visible":true,"mode":"windowed"},"completion":"screenshot_captured"}
+```
 
-**MouseButton:** `Left`, `Right`, `Middle`, `Back`, `Forward`.
-**Scroll unit:** `Line`, `Pixel`.
+`label` is omitted if absent; `window_at_completion` is omitted if the primary window disappeared. A capture success includes both `result.capture` and `result.latest_capture` plus flattened snapshot fields: `frame`, `game_time_secs`, `window`, `mouse_position`, `pressed_keys`, and `pressed_buttons`.
 
-**KeyCode** (Bevy physical keys, case-insensitive):
+## Input commands
 
-- Letters: `KeyA`..`KeyZ`
-- Digits: `Digit0`..`Digit9`
-- Function: `F1`..`F35`
-- Arrows: `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`
-- Whitespace/edit: `Space`, `Enter`, `Tab`, `Backspace`, `Delete`, `Escape`,
-  `Insert`, `Home`, `End`, `PageUp`, `PageDown`, `CapsLock`
-- Modifiers: `ShiftLeft`/`ShiftRight`, `ControlLeft`/`ControlRight`,
-  `AltLeft`/`AltRight`, `SuperLeft`/`SuperRight`
-- Punctuation: `Backquote`, `Minus`, `Equal`, `BracketLeft`, `BracketRight`,
-  `Backslash`, `Semicolon`, `Quote`, `Comma`, `Period`, `Slash`
-- Numpad: `Numpad0`..`Numpad9`, `NumpadAdd`, `NumpadSubtract`,
-  `NumpadMultiply`, `NumpadDivide`, `NumpadDecimal`, `NumpadEnter`, `NumLock`
-- Media/system: `PrintScreen`, `ScrollLock`, `Pause`, `ContextMenu`,
-  `MediaPlayPause`, `AudioVolumeUp`/`Down`/`Mute`, and more.
+| command | params/defaults |
+|---|---|
+| `key_down` / `key_up` | physical `key` (`KeyCode`, case-insensitive) |
+| `mouse_down` / `mouse_up` | `button` (`Left`, `Right`, `Middle`, `Back`, `Forward`) |
+| `cursor_move` | logical `x`,`y` |
+| `mouse_motion` | raw `dx`,`dy` |
+| `mouse_scroll` | `y`, `x?=0`, `unit?=Line` (`Line` or `Pixel`) |
+| `text` | UTF-8 `value` through Bevy IME |
+| `file_hover` / `file_drop` | `path`; `file_cancel` has no params |
+| `click` | logical `x`,`y`, `button?=Left`, `frames?=1` |
+| `drag` | logical `from:[x,y]`,`to:[x,y]`, `button?=Left`, `steps?=10`, `frames?=steps`; frames >= steps |
+| `scroll` | `lines`, `x?=0`, `unit?=Line` |
+| `key_tap` / `key_hold` | `key`, `frames?=1` |
 
-An invalid name returns `invalid_request` with a "did you mean" suggestion.
+Held primitive input persists until released or `release_all_inputs`; compound actions auto-release. Frame parameters are app-update counts.
 
-On Wayland, cursor commands do not require OS cursor warping; synthetic cursor state is written directly into the Bevy `Window` component and reported in `mouse_position`. If the game itself mutates the window that frame, one OS warp attempt may occur (a single logged error on Wayland).
+## Diagnostics and semantic targets
+
+Require Cargo feature `diagnostics` (which enables `bevy/bevy_state` and `bevy/bevy_ui`) plus explicit registration:
+
+```rust
+app.add_plugins(
+    AgentFeedbackDiagnosticsPlugin::default()
+        .with_state::<AppState>()
+        .with_marker::<Clickable>()
+        .with_resource_field::<RoundStats, _, _>("score", |stats| stats.score),
+);
+```
+
+Registration keys are exact short Rust type names; duplicate/colliding/oversized keys or more than 128 registrations are configuration errors.
+
+Exact requests:
+
+```jsonl
+{"id":20,"command":"target_info","target":{"name":"Play"},"kind":"any"}
+{"id":21,"command":"click_target","target":{"accessibility_label":"Play"},"kind":"ui","button":"Left","frames":1}
+{"id":22,"command":"resource_info","resource":"RoundStats","field":"score"}
+{"id":23,"command":"evaluate_predicate","predicate":{"type":"state_equals","state":"AppState","value":"Playing"}}
+{"id":24,"command":"wait_for","predicate":{"type":"resource_field","resource":"RoundStats","field":"score","operator":"gte","value":10},"max_frames":300}
+{"id":25,"command":"wait_for","predicate":{"type":"marker_count","marker":"Enemy","min":1},"max_frames":300}
+{"id":26,"command":"wait_for","predicate":{"type":"target_exists","target":{"marker":"Clickable"},"kind":"any"},"max_frames":300}
+{"id":27,"command":"wait_for","predicate":{"type":"target_absent","target":{"name":"BlockingModal"},"kind":"any"},"max_frames":300}
+```
+
+Target selector has **exactly one** of `name`, `accessibility_label`, or registered `marker`. `kind?` is `any` (default), `ui`, or `world`; `camera?` is an exact camera Name. `click_target` resolves and clicks atomically. Exact duplicate matches return `ambiguous_target` with at most 16 candidate details and `candidate_details_truncated` when needed; they never select the first. A definitive miss after scanning at most 256 entities returns `target_not_found`; if the cap prevents a definitive miss, `target_search_truncated` reports a candidate-count lower bound. UI targets require visible, unclipped layout bounds. World targets require a unique active compatible camera and successful viewport projection.
+
+Predicate forms:
+
+- `state_equals`: exact registered `state`, bounded scalar `value`.
+- `resource_field`: exact registered `resource` and `field`; operator `eq|ne|lt|lte|gt|gte`; ordering requires numbers.
+- `marker_count`: exact registered `marker`; at least one of u32 `min`/`max`.
+- `target_exists` / `target_absent`: target selector plus optional kind/camera.
+
+Only outcome `matched` satisfies a wait. Marker scans cap at 256. If `count_is_lower_bound=true`, a minimum can still match when proven, but a maximum/absence that cannot be proven is `indeterminate`, never a false match. Target absence is likewise indeterminate after a truncated search.
+
+Legacy diagnostic commands remain: `ecs_summary`; `list_entities` (256 cap); `camera_info` (32 cap); registered `state_info`; registered `marker_info`. Their `truncated` and `*_is_lower_bound` flags mean totals are not exact.
+
+## Errors and completion context
+
+Common codes include `invalid_request`, `invalid_argument`, `line_too_long`, `queue_full`, `closed`, `timeout`, `missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`, `diagnostics_unavailable`, `ambiguous_target`, `target_search_truncated`, `target_not_found`, timing-state errors, and `socket_error`.
+
+Errors may carry bounded `context.latest_capture`, `snapshot`, `timing`, `observed_predicate`, `ecs_summary`, and `diagnostic` details. Clients retain the latest capture and predicate observation; failure artifacts expose this context rather than reinterpreting it.
+
+An invalid key/button name returns `invalid_request` with a suggestion. `position_out_of_bounds` reports the point and logical window size. On Wayland, cursor commands write synthetic state directly into Bevy's `Window`; OS cursor warping is not required.

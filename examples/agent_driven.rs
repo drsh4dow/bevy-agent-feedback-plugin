@@ -38,6 +38,7 @@ fn main() {
             }),
         max_wait_frames: 600,
         command_timeout: Duration::from_secs(30),
+        deterministic_time: true,
         ..Default::default()
     };
     let protocol_file = config.protocol_file.clone();
@@ -146,14 +147,41 @@ fn finish_when_agent_done(
 
 fn drive_agent(protocol_file: &Path) -> Result<(), String> {
     let mut client = AgentClient::connect(protocol_file).map_err(|error| error.to_string())?;
-    client.wait(10).map_err(|error| error.to_string())?;
-    let before = client.capture().map_err(|error| error.to_string())?;
-    println!("before capture: {}", before.path.display());
+    let before = client
+        .wait_until_first_capture()
+        .map_err(|error| error.to_string())?;
+    println!(
+        "before capture: path={} sequence={} requested_frame={} completed_frame={} image={}x{} request_window={:?} completion_window={:?} completion={:?}",
+        before.path.display(),
+        before.sequence,
+        before.requested_frame,
+        before.completed_frame,
+        before.image_width,
+        before.image_height,
+        before.window_at_request,
+        before.window_at_completion,
+        before.completion,
+    );
 
+    // The 45-frame hold is an app-update duration, not 45 frames of gameplay time.
     client
         .key_hold("KeyW", 45)
         .map_err(|error| error.to_string())?;
-    let after = client.capture().map_err(|error| error.to_string())?;
-    println!("after capture: {}", after.path.display());
+    let after = client
+        .capture_after_frames(1, Some("after_move"))
+        .map_err(|error| error.to_string())?;
+    println!(
+        "after capture: path={} sequence={} label={:?} requested_frame={} completed_frame={} image={}x{} request_window={:?} completion_window={:?} completion={:?}",
+        after.path.display(),
+        after.sequence,
+        after.label,
+        after.requested_frame,
+        after.completed_frame,
+        after.image_width,
+        after.image_height,
+        after.window_at_request,
+        after.window_at_completion,
+        after.completion,
+    );
     Ok(())
 }
