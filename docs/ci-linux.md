@@ -8,7 +8,7 @@ Ubuntu-style baseline:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y clang mold xvfb mesa-vulkan-drivers libx11-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev libudev-dev pkg-config
+sudo apt-get install -y clang mold xvfb mesa-vulkan-drivers libx11-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev libudev-dev pkg-config python3-pil
 # Optional OCR assertions:
 sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
 ```
