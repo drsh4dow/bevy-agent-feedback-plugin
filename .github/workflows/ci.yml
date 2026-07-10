@@ -40,6 +40,7 @@ jobs:
       - run: rustup component add rustfmt clippy rustc-codegen-cranelift
       - name: Verify rendered agent feedback
         env:
+          CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
           RUST_BACKTRACE: "1"
           WGPU_BACKEND: vulkan
         run: xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
