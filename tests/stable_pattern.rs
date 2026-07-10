@@ -193,6 +193,7 @@ fn drive_stable_pattern(
     })
     .map_err(|error| error.to_string())?;
 
+    client.wait_frames(8).map_err(|error| error.to_string())?;
     let before = client
         .wait_until_first_capture()
         .map_err(|error| error.to_string())?;
