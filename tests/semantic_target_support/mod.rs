@@ -3,7 +3,7 @@ use bevy::{
     camera::{Viewport, primitives::Aabb},
     prelude::*,
     render::RenderPlugin,
-    window::{ExitCondition, PrimaryWindow, WindowResolution},
+    window::{CursorMoved, ExitCondition, WindowResolution},
     winit::WinitPlugin,
 };
 use bevy_agent_feedback_plugin::{
@@ -358,18 +358,27 @@ fn spawn_semantic_scene(mut commands: Commands) {
 
 fn observe_click_then_move(
     mouse: Res<ButtonInput<MouseButton>>,
-    window: Single<&Window, With<PrimaryWindow>>,
+    mut cursor_moved: MessageReader<CursorMoved>,
     mut moving: Single<(&ComputedNode, &UiGlobalTransform, &mut UiTransform), With<MovingTarget>>,
     mut observation: ResMut<ClickObservation>,
     mut motion_frame: Local<u32>,
 ) {
     let (node, global, transform) = &mut *moving;
+    let resolved_center =
+        global.affine().transform_point2(Vec2::ZERO) * node.inverse_scale_factor();
+    let mut closest_cursor = None;
+    let mut closest_distance = f32::INFINITY;
+    for event in cursor_moved.read().take(64) {
+        let distance = event.position.distance(resolved_center);
+        if distance < closest_distance {
+            closest_cursor = Some(event.position);
+            closest_distance = distance;
+        }
+    }
     if mouse.just_pressed(MouseButton::Left) && !observation.saw_press {
-        let resolved_center =
-            global.affine().transform_point2(Vec2::ZERO) * node.inverse_scale_factor();
         observation.saw_press = true;
         observation.resolved_center = resolved_center;
-        observation.cursor = window.cursor_position().unwrap_or(Vec2::splat(f32::NAN));
+        observation.cursor = closest_cursor.unwrap_or(Vec2::splat(f32::NAN));
     }
 
     *motion_frame = motion_frame.wrapping_add(1);
