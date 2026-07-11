@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) const PROTOCOL_VERSION: &str = "bevy-agent-feedback/3";
+pub(crate) const PROTOCOL_VERSION: &str = "bevy-agent-feedback/0.5";
 
 #[derive(Clone, Debug, Resource)]
 pub(crate) struct AgentFeedbackSession {

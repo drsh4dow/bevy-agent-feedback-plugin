@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Python client for bevy-agent-feedback v3."""
+"""Python client for bevy-agent-feedback 0.5."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Callable, Iterable, NoReturn, Sequence
 
-PROTOCOL_VERSION = "bevy-agent-feedback/3"
+PROTOCOL_VERSION = "bevy-agent-feedback/0.5"
 DEFAULT_MAX_WAIT_FRAMES = 300
 DEFAULT_MAX_ABORT_PREDICATES = 16
 DEFAULT_MAX_TIME_ADVANCE_STEPS = 600
@@ -912,7 +912,10 @@ class BevyFeedbackClient:
             ) from error
         version = protocol.get("protocol")
         if version != PROTOCOL_VERSION:
-            raise BevyFeedbackError(f"unsupported protocol {version!r}; expected {PROTOCOL_VERSION}")
+            raise BevyFeedbackError(
+                f"protocol_version_mismatch: game uses {version!r}, client expects {PROTOCOL_VERSION}; "
+                "upgrade or downgrade the client and game to the same 0.5 release"
+            )
         pid = int(protocol.get("pid", 0))
         if pid <= 0 or not _process_alive(pid):
             raise BevyFeedbackError(f"protocol stale: process {pid} is not alive")

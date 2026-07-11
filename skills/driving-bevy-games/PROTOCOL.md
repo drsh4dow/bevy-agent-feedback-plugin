@@ -1,4 +1,4 @@
-# bevy-agent-feedback protocol v3 reference
+# bevy-agent-feedback protocol 0.5 reference
 
 Offline wire reference for `bevy-agent-feedback-plugin`. The running app's protocol file is authoritative: inspect its live `commands`, examples, timing mode, and caps rather than guessing.
 
@@ -15,7 +15,7 @@ Protocol-file fields:
 
 | field | meaning |
 |---|---|
-| `protocol` | exactly `bevy-agent-feedback/3` |
+| `protocol` | exactly `bevy-agent-feedback/0.5` |
 | `socket_addr`, `session_id`, `pid`, `started_at_unix_ms` | endpoint and session identity |
 | `heartbeat_file`, `heartbeat_interval_ms`, `stale_after_ms` | liveness; PID and fresh heartbeat are both required |
 | `capture_dir` | persisted PNG directory |
@@ -133,7 +133,18 @@ Legacy diagnostic commands remain: `ecs_summary`; `list_entities` (256 cap); `ca
 
 ## Errors and completion context
 
-Common codes include `invalid_request`, `invalid_argument`, `line_too_long`, `queue_full`, `closed`, `timeout`, `predicate_timeout`, `predicate_aborted`, `missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`, `diagnostics_unavailable`, `ambiguous_target`, `target_search_truncated`, `target_not_found`, timing-state errors, and `socket_error`.
+| code | direct remedy |
+|---|---|
+| `protocol_version_mismatch` | install client and game from the same 0.5 release |
+| `invalid_request`, `invalid_argument`, `line_too_long` | follow the live `commands` schema and keep each JSON line below 8192 bytes |
+| `queue_full`, `closed`, `timeout`, `socket_error` | reduce concurrent requests; use the fresh protocol file; bound or raise the client timeout |
+| `predicate_timeout`, `predicate_aborted` | inspect the observation and failure capture; register/fix readiness or handle the reported terminal state |
+| `missing_window`, `position_out_of_bounds` | create one primary window and use current logical dimensions from `window_info` |
+| `capture_dir`, `capture_failed` | make the capture root writable; enable the required Bevy image-format feature; verify render/display startup |
+| `diagnostics_unavailable`, `state_missing`, `resource_missing` | enable diagnostics and explicitly register the queried state/resource field |
+| `ambiguous_target`, `target_search_truncated`, `target_not_found` | provide one unique selector and reduce capped searches; truncation never proves absence |
+| `time_control_frozen`, `time_control_disabled`, `time_control_unavailable` | use deterministic `advance_time` or normal-time `wait_seconds` as advertised; install time resources first |
+| `invalid_time_advance`, `nominal_step_exceeds_max_delta`, `runtime_strategy_conflict`, `virtual_time_paused`, `virtual_time_speed_not_one`, `wait_seconds_timeout` | obey advertised step/frame/seconds caps, unpause time at speed 1, and remove conflicting time strategy |
 
 Errors may carry bounded `context.latest_capture`, `snapshot`, `timing`, `observed_predicate`, `ecs_summary`, and `diagnostic` details. After `predicate_timeout` or `predicate_aborted`, client wait helpers best-effort request a `semantic-wait-failure` capture and attach its metadata as `failure_capture` on the original error. Capture failure never replaces the semantic error.
 

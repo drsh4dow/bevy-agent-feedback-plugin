@@ -28,6 +28,21 @@ from bevy_feedback import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class ProtocolCompatibilityTests(unittest.TestCase):
+    def test_mismatch_explains_how_to_synchronize_client_and_game(self) -> None:
+        client = BevyFeedbackClient.__new__(BevyFeedbackClient)
+        with tempfile.TemporaryDirectory() as directory:
+            client.protocol_file = Path(directory) / "protocol.json"
+            client.protocol_file.write_text(
+                json.dumps({"protocol": "bevy-agent-feedback/0.4"}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                BevyFeedbackError,
+                r"protocol_version_mismatch.*upgrade or downgrade.*same 0\.5 release",
+            ):
+                client._read_protocol()
+
+
 class RecordingTransport:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self.responses = list(responses)

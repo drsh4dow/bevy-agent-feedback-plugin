@@ -82,7 +82,7 @@ fn window_fixture(
     fs::write(
         &protocol_file,
         serde_json::to_vec(&serde_json::json!({
-            "protocol": "bevy-agent-feedback/3",
+            "protocol": "bevy-agent-feedback/0.5",
             "session_id": "window-contract",
             "pid": std::process::id(),
             "heartbeat_file": heartbeat,

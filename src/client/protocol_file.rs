@@ -57,13 +57,13 @@ pub(super) fn read_protocol(path: &Path) -> Result<ProtocolFile, ClientError> {
     let value: Value = serde_json::from_slice(&bytes)?;
     let Some(version) = value["protocol"].as_str() else {
         return Err(ClientError::Protocol(format!(
-            "unknown protocol file {}; missing protocol, expected {PROTOCOL_VERSION}",
+            "protocol_version_mismatch: protocol file {} is missing protocol; expected {PROTOCOL_VERSION}. Install a client and game from the same 0.5 release",
             path.display()
         )));
     };
     if version != PROTOCOL_VERSION {
         return Err(ClientError::Protocol(format!(
-            "unsupported protocol '{version}'; expected {PROTOCOL_VERSION}"
+            "protocol_version_mismatch: game uses '{version}', expected {PROTOCOL_VERSION}; upgrade or downgrade the client and game to the same 0.5 release"
         )));
     }
     let protocol: ProtocolFile = serde_json::from_value(value)?;

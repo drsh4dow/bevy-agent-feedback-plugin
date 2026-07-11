@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::{fs, net::SocketAddr, time::Duration};
 
 #[test]
-fn writes_complete_v3_discovery_metadata() {
+fn writes_complete_0_5_discovery_metadata() {
     let root =
         std::env::temp_dir().join(format!("bevy-agent-protocol-{}", crate::session::unix_ms()));
     let config = AgentFeedbackConfig {

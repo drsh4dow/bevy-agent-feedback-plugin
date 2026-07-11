@@ -11,6 +11,18 @@ import {
   type Predicate,
 } from "../clients/typescript/bevy_feedback.ts";
 
+test("protocol mismatch explains how to synchronize client and game", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bevy-feedback-ts-mismatch-"));
+  const protocol = path.join(root, "agent.json");
+  fs.writeFileSync(protocol, JSON.stringify({ protocol: "bevy-agent-feedback/0.4" }));
+
+  assert.throws(
+    () => new BevyFeedbackClient({ protocolFile: protocol }),
+    /protocol_version_mismatch.*upgrade or downgrade.*same 0\.5 release/,
+  );
+  fs.rmSync(root, { recursive: true });
+});
+
 type Fixture = {
   client: BevyFeedbackClient;
   requests: JsonObject[];
@@ -51,7 +63,7 @@ async function fixture(
   fs.writeFileSync(
     protocol,
     JSON.stringify({
-      protocol: "bevy-agent-feedback/3",
+      protocol: "bevy-agent-feedback/0.5",
       socket_addr: `127.0.0.1:${address.port}`,
       pid: process.pid,
       heartbeat_file: heartbeat,

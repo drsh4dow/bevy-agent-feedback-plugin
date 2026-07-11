@@ -1,6 +1,6 @@
 # bevy-agent-feedback-plugin
 
-Local, bounded agent input, semantic diagnostics, deterministic Bevy time, and completion-confirmed PNG feedback for Bevy 0.19 apps over a v3 JSON-lines TCP protocol.
+Local, bounded agent input, semantic diagnostics, deterministic Bevy time, and completion-confirmed PNG feedback for Bevy 0.19 apps over the 0.5 JSON-lines TCP protocol.
 
 ## Install and wire
 
@@ -51,8 +51,10 @@ bevy-feedback doctor
 
 bevy-feedback run \
   --require-window-size 1280x720 \
-  --prepare cargo build --features agent \
+  --prepare-timeout 600000 \
+  --protocol-timeout 30000 \
   --game-cwd "$PWD" \
+  --prepare cargo build --features agent \
   --game cargo run --features agent \
   --driver python3 my_driver.py
 ```
@@ -69,7 +71,7 @@ Public clients use:
 
 Capture metadata includes sequence/path/label, request and completion app-update frames, PNG dimensions, request/completion window metadata, and `completion: "screenshot_captured"`. This proves Bevy screenshot readback and PNG persistence, not OS/window-compositor presentation.
 
-Raw v3 JSON-lines retains the compatibility wire command `"wait"`:
+Raw 0.5 JSON-lines retains the compatibility wire command `"wait"`:
 
 ```jsonl
 {"id":1,"command":"wait","frames":1}

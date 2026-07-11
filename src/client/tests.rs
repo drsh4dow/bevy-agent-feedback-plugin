@@ -3,6 +3,24 @@ use crate::DiagnosticValue;
 use image::{ImageBuffer, Rgba};
 
 #[test]
+fn protocol_mismatch_explains_how_to_synchronize_client_and_game() {
+    let root = std::env::temp_dir().join(format!("bevy-agent-client-mismatch-{}", unix_ms()));
+    fs::create_dir_all(&root).expect("temp root");
+    let protocol = root.join("protocol.json");
+    fs::write(&protocol, r#"{"protocol":"bevy-agent-feedback/0.4"}"#).expect("protocol file");
+
+    let error = match AgentClient::connect(&protocol) {
+        Ok(_) => panic!("old protocol must fail"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("protocol_version_mismatch"), "{message}");
+    assert!(message.contains("upgrade or downgrade"), "{message}");
+    assert!(message.contains("same 0.5 release"), "{message}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn image_diff_counts_changed_pixels() {
     let root = std::env::temp_dir().join(format!("bevy-agent-client-{}", unix_ms()));
     fs::create_dir_all(&root).expect("temp root");
@@ -71,7 +89,11 @@ fn rejects_old_protocol_files() {
     .expect("protocol");
 
     let error = read_protocol(&protocol).expect_err("v1 should be rejected");
-    assert!(error.to_string().contains("expected bevy-agent-feedback/3"));
+    assert!(
+        error
+            .to_string()
+            .contains("expected bevy-agent-feedback/0.5")
+    );
     let _ = fs::remove_dir_all(root);
 }
 

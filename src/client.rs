@@ -1,4 +1,4 @@
-//! Rust client for the v3 agent feedback protocol.
+//! Rust client for the 0.5 agent feedback protocol.
 
 #[cfg(test)]
 use crate::session::PROTOCOL_VERSION;

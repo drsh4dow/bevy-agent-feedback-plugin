@@ -1,6 +1,6 @@
 # Examples
 
-These examples show how Pi/Codex can discover and drive an instrumented Bevy app with protocol v3.
+These examples show how Pi/Codex can discover and drive an instrumented Bevy app with protocol 0.5.
 
 ## `minimal`
 

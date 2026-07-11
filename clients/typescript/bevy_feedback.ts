@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as net from "node:net";
 
-const PROTOCOL_VERSION = "bevy-agent-feedback/3";
+const PROTOCOL_VERSION = "bevy-agent-feedback/0.5";
 const DEFAULT_MAX_WAIT_FRAMES = 300;
 const DEFAULT_MAX_ABORT_PREDICATES = 16;
 const NANOSECONDS_PER_SECOND = 1_000_000_000n;
@@ -768,7 +768,9 @@ function readProtocol(path: string): JsonObject {
     throw new BevyFeedbackError(`protocol file is not an object: ${path}`);
   }
   if (protocol.protocol !== PROTOCOL_VERSION) {
-    throw new BevyFeedbackError(`unsupported protocol ${String(protocol.protocol)}; expected ${PROTOCOL_VERSION}`);
+    throw new BevyFeedbackError(
+      `protocol_version_mismatch: game uses ${String(protocol.protocol)}, client expects ${PROTOCOL_VERSION}; upgrade or downgrade the client and game to the same 0.5 release`,
+    );
   }
   const pid = typeof protocol.pid === "number" ? protocol.pid : 0;
   if (pid <= 0 || !processAlive(pid)) {

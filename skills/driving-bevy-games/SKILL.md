@@ -25,10 +25,12 @@ Run game and driver:
 
 ```sh
 bevy-feedback run \
-  --prepare cargo build --features agent \
+  --prepare-timeout 600000 \
+  --protocol-timeout 30000 \
   --game-cwd "$PWD" \
+  --prepare cargo build --features agent \
   --game cargo run --features agent \
-  --driver python3 tests/drive_smoke.py
+  --driver python3 my_driver.py
 ```
 
 `bevy-feedback run` injects the bundled `bevy_feedback` module. Manual drivers outside the wrapper need `PYTHONPATH=skills/driving-bevy-games`. The canonical source is `clients/python/bevy_feedback.py`; the skill copy is byte-identical.
@@ -169,15 +171,18 @@ Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<arti
 
 The wrapper releases inputs and sends `shutdown`. Manual clients should call `BevyFeedbackClient.close()`.
 
-| symptom | fix |
+### Runner result codes
+
+| code | remedy |
 |---|---|
-| protocol ready but game not ready | wait on a registered predicate/target, then `capture_after_frames(1)` |
-| `time_control_frozen` | replace observational `wait_seconds` with `advance_time` |
-| semantic command unavailable | enable `diagnostics` and register the state/resource/marker |
-| ambiguous target | make exact Name/accessibility label/marker unique; never select the first candidate |
-| target search truncated | reduce ambiguity or expose a unique registered marker; absence was not proven |
-| image assertion misses | verify physical PNG dimensions/scale and recompute regions after resize |
-| no screenshots | inspect `protocol.json.capture_dir` and capture completion metadata |
-| no display/CI | use a real display, Wayland, or `xvfb-run -s '-screen 0 1280x720x24'` |
+| `prepare_spawn_failed`, `prepare_nonzero_exit`, `prepare_timeout`, `prepare_wait_failed` | verify the preparation argv/toolchain; inspect `prepare.log`; raise `--prepare-timeout` for cold compilation |
+| `game_spawn_failed`, `game_wait_failed`, `game_nonzero_exit` | verify game argv and `--game-cwd`; inspect `game.log`; check asset roots and enable Bevy image-format features used by assets |
+| `protocol_early_exit`, `protocol_timeout` | confirm the plugin is enabled and writes `BEVY_FEEDBACK_PROTOCOL`; increase `--protocol-timeout` for startup only, not preparation |
+| `window_size_unavailable`, `window_size_mismatch` | create one primary window; own the display and pin resolution/scale; match `--require-window-size` |
+| `driver_spawn_failed`, `driver_nonzero_exit`, `driver_timeout`, `driver_wait_failed` | inspect `driver.log`, transcript, and semantic failure capture; bound waits below advertised frame caps |
+| `teardown_forced_termination` | ensure the driver closes, the game handles protocol `shutdown`, and both exit before `--shutdown-timeout` |
+| `artifact_setup_failed`, `artifact_copy_failed`, `driver_log_failed` | make the artifact root writable and ensure sufficient disk space |
+
+Protocol codes and remedies are maintained separately in [`PROTOCOL.md`](PROTOCOL.md#errors-and-completion-context).
 
 Exact window dimensions are reliable only when the test owns the display environment. Window managers may override `WindowResolution`, and screenshot readback has window/display/compositor constraints.

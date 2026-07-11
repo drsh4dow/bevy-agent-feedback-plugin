@@ -2,8 +2,9 @@
 """End-to-end driver for the ignored rendered skill workflow test."""
 from __future__ import annotations
 
-import os
+import json
 import math
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,12 @@ def validate_capture(
 
 
 def drive(game: BevyFeedbackClient) -> None:
+    protocol_file = Path(os.environ.get("BEVY_FEEDBACK_PROTOCOL", ""))
+    protocol = json.loads(protocol_file.read_text(encoding="utf-8"))
+    require(
+        protocol.get("protocol") == "bevy-agent-feedback/0.5",
+        f"unexpected protocol version: {protocol.get('protocol')!r}",
+    )
     artifact_dir = Path(os.environ.get("BEVY_FEEDBACK_ARTIFACTS", ""))
     expected_module = (artifact_dir / "python" / "bevy_feedback.py").resolve()
     actual_module = Path(bevy_feedback.__file__).resolve()

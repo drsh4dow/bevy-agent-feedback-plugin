@@ -22,5 +22,9 @@ BEVY_FEEDBACK_PROTOCOL="${AGENT_FEEDBACK_ARTIFACT_ROOT}/skill-workflow/agent-fee
 BEVY_FEEDBACK_ARTIFACTS="${BEVY_FEEDBACK_ARTIFACTS}/skill-workflow" \
   target/debug/bevy-feedback run \
     --require-window-size 640x480 \
+    --prepare-timeout 600000 \
+    --protocol-timeout 30000 \
+    --game-cwd "$PWD" \
+    --prepare cargo build --all-features --test skill_workflow \
     --game cargo test --all-features --test skill_workflow -- --ignored --exact skill_workflow --nocapture \
     --driver python3 tests/fixtures/skill_workflow_driver.py

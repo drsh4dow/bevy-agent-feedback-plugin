@@ -18,10 +18,7 @@ sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
 Compile/lint/test without a display:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo check --examples
+scripts/verify-release.sh
 ```
 
 Rendered smoke (the same externally owned Xvfb recipe used by `.github/workflows/ci.yml`):
@@ -68,8 +65,10 @@ Upload `target/agent-feedback` (or `$BEVY_FEEDBACK_ARTIFACTS` when set) on failu
 env -u WAYLAND_DISPLAY xvfb-run -a -s '-screen 0 1280x720x24' \
   cargo run --bin bevy-feedback -- run \
   --require-window-size 640x480 \
-  --prepare cargo build --example minimal \
+  --prepare-timeout 600000 \
+  --protocol-timeout 30000 \
   --game-cwd "$PWD" \
+  --prepare cargo build --example minimal \
   --game cargo run --example minimal \
   --driver python3 my_driver.py
 ```

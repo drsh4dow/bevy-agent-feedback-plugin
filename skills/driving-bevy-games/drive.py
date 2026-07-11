@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdin JSON-lines to stdout JSON-lines driver for bevy-agent-feedback v3.
+"""Stdin JSON-lines to stdout JSON-lines driver for bevy-agent-feedback 0.5.
 
 Self-contained: imports the bundled client next to this file, so the skill
 works when installed outside the source repository.
