@@ -21,5 +21,6 @@ cargo test --all-features --test capture_metadata -- --nocapture
 BEVY_FEEDBACK_PROTOCOL="${AGENT_FEEDBACK_ARTIFACT_ROOT}/skill-workflow/agent-feedback.json" \
 BEVY_FEEDBACK_ARTIFACTS="${BEVY_FEEDBACK_ARTIFACTS}/skill-workflow" \
   target/debug/bevy-feedback run \
+    --require-window-size 640x480 \
     --game cargo test --all-features --test skill_workflow -- --ignored --exact skill_workflow --nocapture \
     --driver python3 tests/fixtures/skill_workflow_driver.py

@@ -155,7 +155,7 @@ game.key_hold("KeyW", 45)
 
 ## Results, cleanup, troubleshooting
 
-Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<artifacts>/screenshots/`. Semantic timeout/abort helpers best-effort request `semantic-wait-failure` and attach its metadata without replacing the original error if capture fails. Failures preserve bounded structured server context and latest capture metadata in `failure-summary.txt`/`transcript.jsonl`.
+Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<artifacts>/screenshots/`. Semantic timeout/abort helpers best-effort request `semantic-wait-failure` and attach its metadata without replacing the original error if capture fails. Failures preserve full logs and transcripts; `failure-summary.txt` prioritizes bounded structured context and that post-failure capture, then one deduplicated log tail.
 
 | path | purpose |
 |---|---|
@@ -165,7 +165,7 @@ Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<arti
 | `captures/` | wrapper-exported fallback live capture directory |
 | `screenshots/` | final copied PNGs |
 | `run-summary.json` | versioned result code, phase/timings, launch context, artifacts, process exit, teardown |
-| `failure-summary.txt` | failure reason, bounded diagnostic context, log tails, newest capture |
+| `failure-summary.txt` | stable code/summary, semantic evidence, post-failure capture, one deduplicated tail, artifact references, teardown |
 
 The wrapper releases inputs and sends `shutdown`. Manual clients should call `BevyFeedbackClient.close()`.
 

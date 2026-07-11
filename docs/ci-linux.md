@@ -24,11 +24,14 @@ cargo test
 cargo check --examples
 ```
 
-Rendered smoke:
+Rendered smoke (the same externally owned Xvfb recipe used by `.github/workflows/ci.yml`):
 
 ```sh
-WGPU_BACKEND=vulkan xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
+env -u WAYLAND_DISPLAY WGPU_BACKEND=vulkan \
+  xvfb-run -a -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
 ```
+
+`xvfb-run` creates and tears down the display around the runner. `bevy-feedback` deliberately does neither. Unsetting `WAYLAND_DISPLAY` ensures local Wayland sessions do not bypass Xvfb; omit that wrapper when intentionally testing the real session.
 
 Pin capture dimensions in examples/tests:
 
@@ -62,12 +65,13 @@ Upload `target/agent-feedback` (or `$BEVY_FEEDBACK_ARTIFACTS` when set) on failu
 ## Wrapper example
 
 ```sh
-xvfb-run -s '-screen 0 1280x720x24' \
+env -u WAYLAND_DISPLAY xvfb-run -a -s '-screen 0 1280x720x24' \
   cargo run --bin bevy-feedback -- run \
+  --require-window-size 640x480 \
   --prepare cargo build --example minimal \
   --game-cwd "$PWD" \
   --game cargo run --example minimal \
   --driver python3 my_driver.py
 ```
 
-The wrapper exports `BEVY_FEEDBACK_PROTOCOL`, `BEVY_FEEDBACK_CAPTURE_DIR`, `BEVY_FEEDBACK_ARTIFACTS`, and `BEVY_FEEDBACK_TRANSCRIPT`, then releases inputs and requests shutdown during cleanup. `run-summary.json` records acknowledgment, socket closure, child exit, and any forced termination. `--ready-timeout` is a deprecated alias for `--protocol-timeout`; prepare has a separate timeout.
+The wrapper exports `BEVY_FEEDBACK_PROTOCOL`, `BEVY_FEEDBACK_CAPTURE_DIR`, `BEVY_FEEDBACK_ARTIFACTS`, and `BEVY_FEEDBACK_TRANSCRIPT`, then releases inputs and requests shutdown during cleanup. `run-summary.json` records acknowledgment, socket closure, child exit, forced termination, and required/actual logical and physical window dimensions plus scale factor. A compositor override produces stable `window_size_mismatch`; normalized client coordinates still use observed logical dimensions. `BEVY_FEEDBACK_REQUIRED_WINDOW_SIZE=640x480` is equivalent to the flag. `--ready-timeout` is a deprecated alias for `--protocol-timeout`; prepare has a separate timeout.

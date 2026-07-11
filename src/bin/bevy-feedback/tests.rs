@@ -43,264 +43,6 @@ fn copies_only_png_captures_sorted() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn transcript_prefers_latest_error_context_over_later_diagnostic_details() {
-    let root = temp_root("latest-error");
-    fs::create_dir_all(&root).expect("temp root");
-    let transcript = root.join("transcript.jsonl");
-    write_envelopes(
-        &transcript,
-        &[
-            serde_json::json!({
-                "response": {"error": {"context": {"error": "older"}}}
-            }),
-            serde_json::json!({
-                "response": {"error": {"context": {"error": "latest", "frame": 41}}}
-            }),
-            serde_json::json!({
-                "request": {"command": "evaluate_predicate"},
-                "response": {
-                    "result": {
-                        "status": "predicate_evaluated",
-                        "details": {"matched": true, "frame": 42}
-                    }
-                }
-            }),
-        ],
-    );
-
-    let context = transcript_diagnostic_context(&transcript).expect("read transcript");
-
-    assert_eq!(
-        context,
-        Some(serde_json::json!({"error": "latest", "frame": 41}))
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn transcript_uses_latest_diagnostic_details_without_error_context() {
-    let root = temp_root("diagnostic-fallback");
-    fs::create_dir_all(&root).expect("temp root");
-    let transcript = root.join("transcript.jsonl");
-    write_envelopes(
-        &transcript,
-        &[
-            serde_json::json!({
-                "response": {
-                    "result": {
-                        "status": "target_info",
-                        "details": {"target": "older"}
-                    }
-                }
-            }),
-            serde_json::json!({
-                "request": {"command": "ecs_summary"},
-                "response": {
-                    "result": {
-                        "status": "ok",
-                        "details": {"entities": 17, "frame": 73}
-                    }
-                }
-            }),
-            serde_json::json!({
-                "request": {"command": "wait_seconds"},
-                "response": {
-                    "result": {
-                        "status": "waited",
-                        "details": {"frames": 2}
-                    }
-                }
-            }),
-        ],
-    );
-
-    let context = transcript_diagnostic_context(&transcript).expect("read transcript");
-
-    assert_eq!(
-        context,
-        Some(serde_json::json!({"entities": 17, "frame": 73}))
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn diagnostic_context_block_is_capped_at_eight_kibibytes() {
-    let root = temp_root("context-cap");
-    fs::create_dir_all(&root).expect("temp root");
-    let transcript = root.join("transcript.jsonl");
-    write_envelopes(
-        &transcript,
-        &[serde_json::json!({
-            "response": {
-                "error": {
-                    "context": {
-                        "message": format!("prefix-{}-suffix", "x".repeat(20 * 1024))
-                    }
-                }
-            }
-        })],
-    );
-    let mut summary = String::new();
-
-    append_transcript_context(&mut summary, &transcript);
-
-    assert!(
-        summary.len() <= DIAGNOSTIC_BLOCK_MAX_BYTES,
-        "diagnostic block was {} bytes",
-        summary.len()
-    );
-    assert!(summary.starts_with("diagnostic context:\n"));
-    assert!(summary.contains("\"truncated\":true"));
-    assert!(summary.contains("prefix-"));
-    assert!(!summary.contains("-suffix"));
-    let rendered = summary
-        .strip_prefix("diagnostic context:\n")
-        .and_then(|value| value.strip_suffix('\n'))
-        .expect("bounded diagnostic block");
-    serde_json::from_str::<Value>(rendered).expect("truncated context remains valid JSON");
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn transcript_ignores_malformed_lines_and_trailing_partial_record() {
-    let root = temp_root("malformed-and-partial");
-    fs::create_dir_all(&root).expect("temp root");
-    let transcript = root.join("transcript.jsonl");
-    let valid = serde_json::json!({
-        "response": {
-            "result": {
-                "status": "resource_info",
-                "details": {"resource": "Score", "value": 99}
-            }
-        }
-    });
-    fs::write(
-        &transcript,
-        format!("not JSON\n{valid}\n{{\"response\":{{\"error\":"),
-    )
-    .expect("transcript");
-
-    let context = transcript_diagnostic_context(&transcript).expect("read transcript");
-
-    assert_eq!(
-        context,
-        Some(serde_json::json!({
-            "resource": "Score",
-            "value": 99
-        }))
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn transcript_without_complete_diagnostic_context_reports_unavailable() {
-    let root = temp_root("unavailable-context");
-    fs::create_dir_all(&root).expect("temp root");
-    let cases = [
-        ("empty", Some(Vec::new())),
-        ("malformed", Some(b"not JSON\n\xff\n".to_vec())),
-        (
-            "partial",
-            Some(br#"{"response":{"error":{"context":{"reason":"unfinished"}}}}"#.to_vec()),
-        ),
-        (
-            "request-only",
-            Some(br#"{"request":{"command":"ecs_summary"}}"#.to_vec()),
-        ),
-        ("missing", None),
-    ];
-
-    for (name, bytes) in cases {
-        let transcript = root.join(format!("{name}.jsonl"));
-        if let Some(bytes) = bytes {
-            fs::write(&transcript, bytes).expect("transcript");
-        }
-        let mut summary = String::new();
-
-        append_transcript_context(&mut summary, &transcript);
-
-        assert_eq!(
-            summary, "diagnostic context unavailable\n",
-            "unexpected context for {name}"
-        );
-    }
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn fail_run_preserves_original_failure_capture_and_log_tails() {
-    let root = temp_root("failure-artifacts");
-    let artifacts = root.join("artifacts");
-    let capture_dir = root.join("captures");
-    fs::create_dir_all(&artifacts).expect("artifacts");
-    fs::create_dir_all(&capture_dir).expect("captures");
-    let game_log = artifacts.join("game.log");
-    let driver_log = artifacts.join("driver.log");
-    let transcript = artifacts.join("transcript.jsonl");
-    let game_lines = (0..25)
-        .map(|line| format!("game-line-{line:02}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let driver_lines = (0..23)
-        .map(|line| format!("driver-line-{line:02}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&game_log, game_lines).expect("game log");
-    fs::write(&driver_log, driver_lines).expect("driver log");
-    fs::write(capture_dir.join("failure-frame.png"), b"png").expect("capture");
-    write_envelopes(
-        &transcript,
-        &[serde_json::json!({
-            "response": {
-                "error": {
-                    "context": {"predicate": "target_exists", "matched": false}
-                }
-            }
-        })],
-    );
-    let original = "driver exited with status exit status: 7\n".to_string();
-
-    let error = fail_run(
-        &artifacts,
-        &game_log,
-        Some(&driver_log),
-        &capture_dir,
-        &transcript,
-        original.clone(),
-    )
-    .expect_err("run should fail");
-    let summary =
-        fs::read_to_string(artifacts.join("failure-summary.txt")).expect("failure summary");
-
-    assert!(summary.starts_with(&original), "{summary}");
-    assert!(error.contains(&original), "{error}");
-    assert!(
-        summary.contains(&format!("game log: {}", game_log.display())),
-        "{summary}"
-    );
-    assert!(
-        summary.contains(&format!("driver log: {}", driver_log.display())),
-        "{summary}"
-    );
-    assert!(
-        summary.contains(&format!(
-            "newest capture: {}",
-            capture_dir.join("failure-frame.png").display()
-        )),
-        "{summary}"
-    );
-    assert!(!summary.contains("game-line-04"), "{summary}");
-    assert!(summary.contains("game-line-05"), "{summary}");
-    assert!(!summary.contains("driver-line-02"), "{summary}");
-    assert!(summary.contains("driver-line-03"), "{summary}");
-    assert!(
-        summary.contains(r#"{"matched":false,"predicate":"target_exists"}"#),
-        "{summary}"
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
 #[cfg(unix)]
 #[test]
 fn prepare_failures_are_typed_and_always_write_run_summary() {
@@ -323,6 +65,7 @@ fn prepare_failures_are_typed_and_always_write_run_summary() {
         let args = RunArgs {
             protocol_file: root.join("protocol.json"),
             artifacts: artifacts.clone(),
+            required_window_size: None,
             prepare_timeout: timeout,
             protocol_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_millis(50),
@@ -344,7 +87,14 @@ fn prepare_failures_are_typed_and_always_write_run_summary() {
         assert_eq!(summary["phase"], "prepare");
         assert_eq!(summary["result"]["code"], code);
         assert_eq!(summary["result"]["success"], false);
-        assert!(error.contains(code), "{error}");
+        assert!(error.starts_with(&format!("[{code}] ")), "{error}");
+        assert!(
+            error.contains(&format!(
+                "prepare log: {}",
+                artifacts.join("prepare.log").display()
+            )),
+            "{error}"
+        );
         assert!(artifacts.join("prepare.log").exists());
         assert!(!artifacts.join("game.log").exists());
         let _ = fs::remove_dir_all(root);
@@ -363,6 +113,7 @@ fn live_protocol_timeout_and_game_cwd_are_recorded() {
     let args = RunArgs {
         protocol_file: root.join("protocol.json"),
         artifacts: artifacts.clone(),
+        required_window_size: None,
         prepare_timeout: Duration::from_secs(1),
         protocol_timeout: Duration::from_millis(50),
         shutdown_timeout: Duration::from_millis(50),
@@ -406,7 +157,7 @@ fn both_cli_failure_paths_write_focused_failure_artifacts() {
         (
             "dead-game",
             "game exited with status",
-            "diagnostic context unavailable",
+            "semantic evidence: unavailable",
             true,
         ),
     ];
@@ -459,8 +210,21 @@ fn both_cli_failure_paths_write_focused_failure_artifacts() {
                 "game_nonzero_exit"
             }
         );
+        let code = if scenario == "readiness" {
+            "protocol_early_exit"
+        } else {
+            "game_nonzero_exit"
+        };
+        assert!(
+            summary.starts_with(&format!("[{code}] ")),
+            "{scenario}: {summary}"
+        );
         assert!(summary.contains(original_failure), "{scenario}: {summary}");
         assert!(summary.contains(diagnostic), "{scenario}: {summary}");
+        assert!(
+            summary.contains("teardown: inputs="),
+            "{scenario}: {summary}"
+        );
         assert!(
             summary.contains(&format!(
                 "game log: {}",
@@ -496,6 +260,7 @@ fn cli_run_failure_probe() {
     let args = RunArgs {
         protocol_file: artifacts.join("live-protocol.json"),
         artifacts,
+        required_window_size: None,
         prepare_timeout: Duration::from_secs(3),
         protocol_timeout: Duration::from_secs(3),
         shutdown_timeout: Duration::from_millis(100),

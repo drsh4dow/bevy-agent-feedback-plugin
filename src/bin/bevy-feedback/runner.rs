@@ -1,4 +1,6 @@
 use super::*;
+use args::RequiredWindowSize;
+use bevy_agent_feedback_plugin::client::CaptureWindowInfo;
 
 #[derive(serde::Serialize)]
 struct RunSummary {
@@ -9,6 +11,7 @@ struct RunSummary {
     timings_ms: std::collections::BTreeMap<&'static str, u128>,
     launch: LaunchSummary,
     artifacts: ArtifactSummary,
+    window: WindowSummary,
     process_exit: &'static str,
     teardown: TeardownSummary,
     warnings: Vec<String>,
@@ -33,12 +36,20 @@ struct LaunchSummary {
 #[derive(serde::Serialize)]
 struct ArtifactSummary {
     directory: PathBuf,
+    run_summary: PathBuf,
+    failure_summary: Option<PathBuf>,
     game_log: PathBuf,
     prepare_log: Option<PathBuf>,
     driver_log: Option<PathBuf>,
     protocol: PathBuf,
     transcript: PathBuf,
     screenshots: PathBuf,
+}
+
+#[derive(serde::Serialize)]
+struct WindowSummary {
+    required_logical: Option<RequiredWindowSize>,
+    actual: Option<CaptureWindowInfo>,
 }
 
 #[derive(serde::Serialize)]
@@ -106,12 +117,18 @@ pub(super) fn run(args: RunArgs) -> Result<(), String> {
         },
         artifacts: ArtifactSummary {
             directory: args.artifacts.clone(),
+            run_summary: summary_path.clone(),
+            failure_summary: None,
             game_log: game_log.clone(),
             prepare_log: prepare_log.clone(),
             driver_log: driver_log_path.clone(),
             protocol: protocol_artifact.clone(),
             transcript: transcript_file.clone(),
             screenshots: screenshot_dir.clone(),
+        },
+        window: WindowSummary {
+            required_logical: args.required_window_size,
+            actual: None,
         },
         process_exit: "not_started",
         teardown: TeardownSummary::default(),
@@ -142,7 +159,7 @@ pub(super) fn run(args: RunArgs) -> Result<(), String> {
         &mut summary,
     );
     summary.elapsed_ms = started.elapsed().as_millis();
-    match result {
+    let failure = match result {
         Ok(()) => {
             summary.result = RunResult {
                 success: true,
@@ -150,6 +167,7 @@ pub(super) fn run(args: RunArgs) -> Result<(), String> {
                 message: "run completed gracefully".to_string(),
             };
             summary.phase = "complete";
+            None
         }
         Err(failure) => {
             summary.result = RunResult {
@@ -158,12 +176,19 @@ pub(super) fn run(args: RunArgs) -> Result<(), String> {
                 message: failure.message.clone(),
             };
             summary.phase = failure.phase;
+            summary.artifacts.failure_summary = Some(args.artifacts.join("failure-summary.txt"));
+            Some(failure)
         }
-    }
+    };
     let summary_json = serde_json::to_vec_pretty(&summary).map_err(|error| error.to_string())?;
     fs::write(&summary_path, summary_json).map_err(|error| error.to_string())?;
 
-    if summary.result.success {
+    if let Some(failure) = failure {
+        let report = evidence::render_failure(&failure, &summary);
+        fs::write(args.artifacts.join("failure-summary.txt"), &report)
+            .map_err(|error| error.to_string())?;
+        Err(report)
+    } else {
         println!(
             "bevy-feedback ok: phase=complete elapsed_ms={} artifacts={}",
             summary.elapsed_ms,
@@ -177,14 +202,6 @@ pub(super) fn run(args: RunArgs) -> Result<(), String> {
             summary.teardown.child_exit
         );
         Ok(())
-    } else {
-        Err(format!(
-            "{} [{}] (phase={}); summary={}",
-            summary.result.message,
-            summary.result.code,
-            summary.phase,
-            summary_path.display()
-        ))
     }
 }
 
@@ -339,14 +356,6 @@ fn run_lifecycle(
             terminate_game(&mut game, summary);
             copy_if_exists(&args.protocol_file, protocol_artifact);
             let _ = copy_captures(wrapper_capture_dir, screenshot_dir);
-            write_failure_artifacts(
-                args,
-                game_log,
-                None,
-                wrapper_capture_dir,
-                transcript_file,
-                &error,
-            );
             let code = if error.starts_with("game exited") {
                 "protocol_early_exit"
             } else {
@@ -375,8 +384,13 @@ fn run_lifecycle(
         .unwrap_or_else(|| wrapper_capture_dir.to_path_buf());
 
     let driver_started = Instant::now();
-    let mut primary_failure = None;
-    if let (Some(driver_command), Some(log_path)) = (&args.driver, driver_log_path) {
+    let mut primary_failure = match args.required_window_size {
+        Some(required) => inspect_window_contract(args, transcript_file, required, summary).err(),
+        None => None,
+    };
+    if primary_failure.is_none()
+        && let (Some(driver_command), Some(log_path)) = (&args.driver, driver_log_path)
+    {
         primary_failure = run_driver(
             driver_command,
             log_path,
@@ -386,7 +400,7 @@ fn run_lifecycle(
             transcript_file,
         )
         .err();
-    } else {
+    } else if primary_failure.is_none() {
         match wait_game_or_signal(&mut game, &stop).map_err(|error| RunFailure {
             phase: "game",
             code: "game_wait_failed",
@@ -428,26 +442,10 @@ fn run_lifecycle(
     print_screenshots(&screenshots);
 
     if let Some(failure) = primary_failure {
-        write_failure_artifacts(
-            args,
-            game_log,
-            driver_log_path,
-            &live_capture_dir,
-            transcript_file,
-            &failure.message,
-        );
         return Err(failure);
     }
     if summary.teardown.forced_termination {
         let message = "game required forced termination during teardown".to_string();
-        write_failure_artifacts(
-            args,
-            game_log,
-            driver_log_path,
-            &live_capture_dir,
-            transcript_file,
-            &message,
-        );
         return Err(RunFailure {
             phase: "teardown",
             code: "teardown_forced_termination",
@@ -456,14 +454,6 @@ fn run_lifecycle(
     }
     if matches!(summary.process_exit, "nonzero" | "signal") {
         let message = format!("game process exited with category {}", summary.process_exit);
-        write_failure_artifacts(
-            args,
-            game_log,
-            driver_log_path,
-            &live_capture_dir,
-            transcript_file,
-            &message,
-        );
         return Err(RunFailure {
             phase: "teardown",
             code: "game_nonzero_exit",
@@ -476,6 +466,61 @@ fn run_lifecycle(
             .push("game exited cleanly before shutdown acknowledgment".to_string());
     }
     Ok(())
+}
+
+fn inspect_window_contract(
+    args: &RunArgs,
+    transcript_file: &Path,
+    required: RequiredWindowSize,
+    summary: &mut RunSummary,
+) -> Result<(), RunFailure> {
+    let config = AgentClientConfig {
+        protocol_file: args.protocol_file.clone(),
+        transcript_file: Some(transcript_file.to_path_buf()),
+        timeout: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let response = AgentClient::with_config(config)
+        .and_then(|mut client| client.window_info())
+        .map_err(|error| RunFailure {
+            phase: "environment",
+            code: "window_size_unavailable",
+            message: format!("could not observe the primary window: {error}"),
+        })?;
+    let actual = serde_json::from_value::<CaptureWindowInfo>(response["result"]["window"].clone())
+        .map_err(|error| RunFailure {
+            phase: "environment",
+            code: "window_size_unavailable",
+            message: format!("primary window dimensions were invalid: {error}"),
+        })?;
+    println!("{}", window_diagnostic(required, &actual));
+    let matches = actual.logical_width == required.width as f32
+        && actual.logical_height == required.height as f32;
+    summary.window.actual = Some(actual.clone());
+    if !matches {
+        return Err(RunFailure {
+            phase: "environment",
+            code: "window_size_mismatch",
+            message: format!(
+                "required logical window {}x{}, observed {}x{}",
+                required.width, required.height, actual.logical_width, actual.logical_height
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn window_diagnostic(required: RequiredWindowSize, actual: &CaptureWindowInfo) -> String {
+    format!(
+        "bevy-feedback window: required_logical={}x{} actual_logical={}x{} actual_physical={}x{} scale_factor={}",
+        required.width,
+        required.height,
+        actual.logical_width,
+        actual.logical_height,
+        actual.physical_width,
+        actual.physical_height,
+        actual.scale_factor
+    )
 }
 
 fn run_driver(
@@ -534,7 +579,11 @@ fn run_driver(
     }
 }
 
+mod evidence;
 mod process;
 #[cfg(test)]
 pub(crate) use process::spawn_error;
 use process::*;
+
+#[cfg(test)]
+mod tests;

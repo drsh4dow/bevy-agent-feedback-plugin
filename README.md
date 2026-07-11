@@ -50,6 +50,7 @@ cargo install bevy-agent-feedback-plugin
 bevy-feedback doctor
 
 bevy-feedback run \
+  --require-window-size 1280x720 \
   --prepare cargo build --features agent \
   --game-cwd "$PWD" \
   --game cargo run --features agent \
@@ -79,7 +80,7 @@ Raw v3 JSON-lines retains the compatibility wire command `"wait"`:
 {"id":6,"command":"capture_after_frames","frames":1,"label":"playing"}
 ```
 
-Input coordinates are logical primary-window pixels. PNG crop/include/mask rectangles are physical image pixels; use capture dimensions and scale factor, and recompute after resize.
+Input coordinates are logical primary-window pixels. PNG crop/include/mask rectangles are physical image pixels; use capture dimensions and scale factor, and recompute after resize. Normalized-coordinate helpers query the actual logical size, including when a window manager overrides the requested size.
 
 ## Clients
 
@@ -101,6 +102,8 @@ await game.close();
 
 `bevy-feedback run` optionally runs `--prepare` with its own `--prepare-timeout`, then starts the game and begins `--protocol-timeout` at spawn. `--ready-timeout` remains a deprecated alias. Commands inherit the caller cwd; `--game-cwd` affects only the game.
 
-Every completed run writes versioned `run-summary.json` with stable result code, phase/timings, effective commands/cwd, artifacts, coarse process exit, warnings, and teardown observations. Teardown records input release, shutdown acknowledgment, socket closure, child exit, and forced termination. Forced termination fails the run; clean exit before acknowledgment is reported as a warning. `failure-summary.txt` retains bounded diagnostic context, log tails, and the newest capture.
+Every completed run writes versioned `run-summary.json` with stable result code, phase/timings, effective commands/cwd, artifacts, required/actual window dimensions, coarse process exit, warnings, and teardown observations. `--require-window-size WIDTHxHEIGHT` (or `BEVY_FEEDBACK_REQUIRED_WINDOW_SIZE`) enforces the actual logical primary-window size after protocol startup. Terminal diagnostics also report actual logical/physical dimensions and scale factor.
 
-See [`docs/ci-linux.md`](docs/ci-linux.md) for `xvfb-run` and artifact upload. Windowed screenshot readback requires a usable display and is subject to window/compositor constraints.
+Failures start with one stable code and summary, then bounded structured semantic evidence, the post-failure capture when available, one normalized/deduplicated log tail, artifact references, and teardown outcome. Full game/driver logs remain unchanged as artifacts; no cause is guessed from Cargo or Bevy text. Forced termination fails the run; clean exit before acknowledgment is a warning.
+
+See [`docs/ci-linux.md`](docs/ci-linux.md) for maintained external `xvfb-run` and artifact-upload recipes. The runner can enforce window dimensions but intentionally does not own display lifecycle. Windowed screenshot readback requires a usable display and remains subject to window/compositor constraints.

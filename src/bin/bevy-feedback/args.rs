@@ -4,10 +4,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RequiredWindowSize {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RunArgs {
     pub(crate) protocol_file: PathBuf,
     pub(crate) artifacts: PathBuf,
+    pub(crate) required_window_size: Option<RequiredWindowSize>,
     pub(crate) prepare_timeout: Duration,
     pub(crate) protocol_timeout: Duration,
     pub(crate) shutdown_timeout: Duration,
@@ -52,6 +59,8 @@ options:
   --prepare-timeout MS   prepare timeout (default 300000)
   --protocol-timeout MS  protocol startup timeout after game spawn (default 60000)
   --game-cwd DIR         working directory for the game only
+  --require-window-size WIDTHxHEIGHT
+                         fail unless the actual logical window has this size
   --ready-timeout MS     deprecated alias for --protocol-timeout
 
 env:
@@ -62,6 +71,7 @@ env:
   BEVY_FEEDBACK_READY_TIMEOUT_MS     deprecated protocol-timeout fallback
   BEVY_FEEDBACK_DRIVER_TIMEOUT_MS    driver timeout in milliseconds (default 300000)
   BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS  shutdown timeout in milliseconds (default 5000)
+  BEVY_FEEDBACK_REQUIRED_WINDOW_SIZE required logical window size (for example 1280x720)
   BEVY_FEEDBACK_CAPTURE_DIR         exported to game/driver as the capture dir
   BEVY_FEEDBACK_TRANSCRIPT          exported to game/driver as transcript.jsonl
 
@@ -145,6 +155,14 @@ fn parse_run_args(
     let mut protocol_flag_seen = false;
     let mut ready_flag_seen = false;
     let mut game_cwd = None;
+    let mut required_window_size = get_env("BEVY_FEEDBACK_REQUIRED_WINDOW_SIZE")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| "BEVY_FEEDBACK_REQUIRED_WINDOW_SIZE must be valid UTF-8".to_string())
+                .and_then(|value| parse_window_size(&value))
+        })
+        .transpose()?;
     let mut driver_timeout = default_timeout(
         "driver timeout",
         "BEVY_FEEDBACK_DRIVER_TIMEOUT_MS",
@@ -204,6 +222,14 @@ fn parse_run_args(
                 game_cwd = Some(PathBuf::from(option_value(args, index, "--game-cwd")?));
                 index += 2;
             }
+            "--require-window-size" => {
+                required_window_size = Some(parse_window_size(option_value(
+                    args,
+                    index,
+                    "--require-window-size",
+                )?)?);
+                index += 2;
+            }
             "--driver-timeout" => {
                 let value = option_value(args, index, "--driver-timeout")?;
                 driver_timeout = parse_timeout_ms(value, "driver timeout")?;
@@ -226,6 +252,7 @@ fn parse_run_args(
                     &rest[game_index + 1..],
                     protocol_file,
                     artifacts,
+                    required_window_size,
                     prepare_timeout,
                     protocol_timeout,
                     shutdown_timeout,
@@ -240,6 +267,7 @@ fn parse_run_args(
                     &args[index + 1..],
                     protocol_file,
                     artifacts,
+                    required_window_size,
                     prepare_timeout,
                     protocol_timeout,
                     shutdown_timeout,
@@ -257,6 +285,7 @@ fn parse_run_args(
                 return Ok(Command::Run(RunArgs {
                     protocol_file,
                     artifacts,
+                    required_window_size,
                     prepare_timeout,
                     protocol_timeout,
                     shutdown_timeout,
@@ -324,6 +353,20 @@ fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'
     Ok(value)
 }
 
+fn parse_window_size(value: &str) -> Result<RequiredWindowSize, String> {
+    let Some((width, height)) = value.split_once('x') else {
+        return Err(
+            "required window size must use WIDTHxHEIGHT with positive integers".to_string(),
+        );
+    };
+    let width = width.parse::<u32>().ok().filter(|value| *value > 0);
+    let height = height.parse::<u32>().ok().filter(|value| *value > 0);
+    match (width, height) {
+        (Some(width), Some(height)) => Ok(RequiredWindowSize { width, height }),
+        _ => Err("required window size must use WIDTHxHEIGHT with positive integers".to_string()),
+    }
+}
+
 fn parse_timeout_ms(value: &str, name: &str) -> Result<Duration, String> {
     let milliseconds = value
         .parse::<u64>()
@@ -359,6 +402,7 @@ fn parse_game_driver(
     args: &[String],
     protocol_file: PathBuf,
     artifacts: PathBuf,
+    required_window_size: Option<RequiredWindowSize>,
     prepare_timeout: Duration,
     protocol_timeout: Duration,
     shutdown_timeout: Duration,
@@ -381,6 +425,7 @@ fn parse_game_driver(
     Ok(Command::Run(RunArgs {
         protocol_file,
         artifacts,
+        required_window_size,
         prepare_timeout,
         protocol_timeout,
         shutdown_timeout,
@@ -405,380 +450,4 @@ fn unix_ms() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run_args(command: Command) -> RunArgs {
-        match command {
-            Command::Run(args) => args,
-            other => panic!("expected run args, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_game_only_command() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--".into(),
-                "cargo".into(),
-                "run".into(),
-                "--example".into(),
-                "minimal".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.game, ["cargo", "run", "--example", "minimal"]);
-        assert_eq!(args.driver, None);
-    }
-
-    #[test]
-    fn parses_game_and_driver_command() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--protocol".into(),
-                "target/agent.json".into(),
-                "--game".into(),
-                "cargo".into(),
-                "run".into(),
-                "--driver".into(),
-                "python3".into(),
-                "drive.py".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.protocol_file, PathBuf::from("target/agent.json"));
-        assert_eq!(args.game, ["cargo", "run"]);
-        assert_eq!(args.driver, Some(vec!["python3".into(), "drive.py".into()]));
-    }
-
-    #[test]
-    fn parses_timeout_flags_for_game_only_command() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--ready-timeout".into(),
-                "120000".into(),
-                "--driver-timeout".into(),
-                "400000".into(),
-                "--shutdown-timeout".into(),
-                "9000".into(),
-                "--".into(),
-                "cargo".into(),
-                "run".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.protocol_timeout, Duration::from_millis(120_000));
-        assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
-        assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
-    }
-
-    #[test]
-    fn parses_timeout_flags_for_game_and_driver_command() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--ready-timeout".into(),
-                "120000".into(),
-                "--driver-timeout".into(),
-                "400000".into(),
-                "--shutdown-timeout".into(),
-                "9000".into(),
-                "--game".into(),
-                "cargo".into(),
-                "run".into(),
-                "--driver".into(),
-                "python3".into(),
-                "drive.py".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.protocol_timeout, Duration::from_millis(120_000));
-        assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
-        assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
-        assert_eq!(args.game, ["cargo", "run"]);
-        assert_eq!(args.driver, Some(vec!["python3".into(), "drive.py".into()]));
-    }
-
-    #[test]
-    fn parses_prepare_protocol_timeout_and_game_cwd() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--prepare-timeout".into(),
-                "7000".into(),
-                "--protocol-timeout".into(),
-                "8000".into(),
-                "--game-cwd".into(),
-                "/tmp/game".into(),
-                "--prepare".into(),
-                "cargo".into(),
-                "build".into(),
-                "--game".into(),
-                "target/debug/game".into(),
-                "--driver".into(),
-                "python3".into(),
-                "drive.py".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.prepare, Some(vec!["cargo".into(), "build".into()]));
-        assert_eq!(args.prepare_timeout, Duration::from_millis(7_000));
-        assert_eq!(args.protocol_timeout, Duration::from_millis(8_000));
-        assert_eq!(args.game_cwd, Some(PathBuf::from("/tmp/game")));
-        assert!(!args.used_legacy_ready_timeout);
-    }
-
-    #[test]
-    fn legacy_ready_timeout_is_a_deprecated_alias() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--ready-timeout".into(),
-                "9000".into(),
-                "--".into(),
-                "game".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.protocol_timeout, Duration::from_millis(9_000));
-        assert!(args.used_legacy_ready_timeout);
-    }
-
-    #[test]
-    fn rejects_both_protocol_timeout_names() {
-        let error = parse_args(&[
-            "run".into(),
-            "--ready-timeout".into(),
-            "9000".into(),
-            "--protocol-timeout".into(),
-            "8000".into(),
-            "--".into(),
-            "game".into(),
-        ])
-        .expect_err("aliases must not conflict");
-
-        assert!(error.contains("conflicts"), "{error}");
-    }
-
-    #[test]
-    fn rejects_zero_timeout() {
-        let error = parse_args(&[
-            "run".into(),
-            "--ready-timeout".into(),
-            "0".into(),
-            "--".into(),
-            "cargo".into(),
-            "run".into(),
-        ])
-        .expect_err("zero timeout should be rejected");
-
-        assert!(
-            error.contains("protocol timeout must be a positive integer number of milliseconds")
-        );
-    }
-
-    #[test]
-    fn uses_timeout_env_defaults() {
-        let args = run_args(
-            parse_args_with_env(
-                &["run".into(), "--".into(), "cargo".into(), "run".into()],
-                |name| match name {
-                    "BEVY_FEEDBACK_READY_TIMEOUT_MS" => Some(OsString::from("120000")),
-                    "BEVY_FEEDBACK_DRIVER_TIMEOUT_MS" => Some(OsString::from("400000")),
-                    "BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS" => Some(OsString::from("9000")),
-                    _ => None,
-                },
-            )
-            .expect("args"),
-        );
-
-        assert_eq!(args.protocol_timeout, Duration::from_millis(120_000));
-        assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
-        assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
-    }
-
-    #[test]
-    fn parses_run_help() {
-        assert_eq!(
-            parse_args(&["run".into(), "--help".into()]).expect("help"),
-            Command::Help
-        );
-        assert_eq!(
-            parse_args(&["run".into(), "-h".into()]).expect("help"),
-            Command::Help
-        );
-    }
-
-    #[test]
-    fn parses_global_help() {
-        assert_eq!(parse_args(&["--help".into()]).expect("help"), Command::Help);
-        assert_eq!(parse_args(&["-h".into()]).expect("help"), Command::Help);
-    }
-
-    #[test]
-    fn help_does_not_read_timeout_env() {
-        assert_eq!(
-            parse_args_with_env(&["run".into(), "--help".into()], |name| {
-                panic!("help should not read env {name}")
-            })
-            .expect("help"),
-            Command::Help
-        );
-    }
-
-    #[test]
-    fn does_not_consume_help_after_separator() {
-        let args =
-            run_args(parse_args(&["run".into(), "--".into(), "--help".into()]).expect("args"));
-
-        assert_eq!(args.game, ["--help"]);
-    }
-
-    #[test]
-    fn parses_separator_game_path_with_spaces() {
-        let args = run_args(
-            parse_args(&["run".into(), "--".into(), "/tmp/My Game/game".into()]).expect("args"),
-        );
-
-        assert_eq!(args.game, ["/tmp/My Game/game"]);
-        assert_eq!(args.driver, None);
-    }
-
-    #[test]
-    fn parses_game_and_driver_paths_with_spaces() {
-        let args = run_args(
-            parse_args(&[
-                "run".into(),
-                "--game".into(),
-                "/tmp/My Game/game".into(),
-                "--driver".into(),
-                "/tmp/My Driver/driver.py".into(),
-            ])
-            .expect("args"),
-        );
-
-        assert_eq!(args.game, ["/tmp/My Game/game"]);
-        assert_eq!(args.driver, Some(vec!["/tmp/My Driver/driver.py".into()]));
-    }
-
-    #[test]
-    fn parses_global_version() {
-        assert_eq!(
-            parse_args(&["--version".into()]).expect("version"),
-            Command::Version
-        );
-        assert_eq!(
-            parse_args(&["-V".into()]).expect("version"),
-            Command::Version
-        );
-    }
-
-    #[test]
-    fn parses_run_version() {
-        assert_eq!(
-            parse_args(&["run".into(), "--version".into()]).expect("version"),
-            Command::Version
-        );
-        assert_eq!(
-            parse_args(&["run".into(), "-V".into()]).expect("version"),
-            Command::Version
-        );
-    }
-
-    #[test]
-    fn parses_doctor_protocol() {
-        assert_eq!(
-            parse_args(&[
-                "doctor".into(),
-                "--protocol".into(),
-                "target/custom.json".into()
-            ])
-            .expect("doctor"),
-            Command::Doctor(DoctorArgs {
-                protocol_file: PathBuf::from("target/custom.json")
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_command_precisely() {
-        let error = parse_args(&["bad".into()]).expect_err("unknown command");
-        assert_eq!(
-            error,
-            "unknown command 'bad'; expected 'run' or 'doctor' (see 'bevy-feedback --help')"
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_run_option_precisely() {
-        let error = parse_args(&["run".into(), "--bad".into()]).expect_err("unknown option");
-        assert_eq!(
-            error,
-            "unknown option '--bad' (see 'bevy-feedback run --help')"
-        );
-    }
-
-    #[test]
-    fn rejects_missing_value_precisely() {
-        let error = parse_args(&["run".into(), "--protocol".into()]).expect_err("missing value");
-        assert_eq!(error, "option '--protocol' requires a value");
-    }
-
-    #[test]
-    fn rejects_missing_game_precisely() {
-        let error = parse_args(&["run".into()]).expect_err("missing game");
-        assert_eq!(
-            error,
-            "missing game command; use '-- <game...>' or '--game <game...>'"
-        );
-    }
-
-    #[test]
-    fn usage_shows_cargo_driver_argv_example() {
-        let usage = usage();
-
-        assert!(
-            usage.contains(
-                "--game cargo run --features agent --driver python3 tests/drive_camera.py"
-            )
-        );
-        assert!(usage.contains("Do not quote the whole game or driver command"));
-        assert!(usage.contains("doctor"));
-        assert!(usage.contains("--version"));
-        assert!(usage.contains("screenshots"));
-    }
-    #[test]
-    fn usage_points_to_readiness_time_and_capture_completion_guidance() {
-        let usage = usage();
-
-        assert!(
-            usage.contains(
-                "Protocol-ready is not game-ready; use skills/driving-bevy-games/SKILL.md to choose readiness and time control."
-            ),
-            "{usage}"
-        );
-        assert!(
-            usage.contains("Frame waits count app updates, not gameplay time."),
-            "{usage}"
-        );
-        assert!(
-            usage.contains(
-                "For animated games use predicates; use deterministic advance for gameplay time."
-            ),
-            "{usage}"
-        );
-        assert!(
-            usage.contains("Capture completion proves screenshot readback"),
-            "{usage}"
-        );
-    }
-}
+mod tests;

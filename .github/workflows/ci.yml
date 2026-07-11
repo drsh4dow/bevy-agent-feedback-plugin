@@ -46,7 +46,7 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
           WGPU_BACKEND: vulkan
-        run: xvfb-run -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
+        run: env -u WAYLAND_DISPLAY xvfb-run -a -s '-screen 0 1280x720x24' scripts/verify-rendered-agent-feedback.sh
       - name: Upload agent feedback artifacts
         if: failure()
         uses: actions/upload-artifact@v7

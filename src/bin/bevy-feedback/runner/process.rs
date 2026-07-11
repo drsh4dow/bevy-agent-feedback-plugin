@@ -226,24 +226,6 @@ pub(super) fn exit_category(status: &ExitStatus) -> &'static str {
     }
 }
 
-pub(super) fn write_failure_artifacts(
-    args: &RunArgs,
-    game_log: &Path,
-    driver_log: Option<&Path>,
-    capture_dir: &Path,
-    transcript_file: &Path,
-    message: &str,
-) {
-    let _ = fail_run(
-        &args.artifacts,
-        game_log,
-        driver_log,
-        capture_dir,
-        transcript_file,
-        format!("{message}\n"),
-    );
-}
-
 pub(super) fn wait_child(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
