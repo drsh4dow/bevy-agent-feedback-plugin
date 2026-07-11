@@ -9,7 +9,7 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -449,6 +449,18 @@ impl AgentClient {
     /// Asks the Bevy app to exit cleanly.
     pub fn shutdown(&mut self) -> Result<Value, ClientError> {
         self.request(json!({"command": "shutdown"}))
+    }
+
+    /// Waits until the server closes this control connection.
+    pub fn wait_for_disconnect(&mut self) -> Result<(), ClientError> {
+        let mut byte = [0_u8; 1];
+        match self.reader.read(&mut byte) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(ClientError::Protocol(
+                "unexpected protocol data after shutdown acknowledgment".to_string(),
+            )),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn record_response_context(&mut self, response: &Value) {

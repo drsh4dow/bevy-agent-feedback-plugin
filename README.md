@@ -49,7 +49,9 @@ Deterministic mode freezes Bevy-managed virtual/fixed time between `advance_time
 cargo install bevy-agent-feedback-plugin
 bevy-feedback doctor
 
-bevy-feedback run --ready-timeout 180000 \
+bevy-feedback run \
+  --prepare cargo build --features agent \
+  --game-cwd "$PWD" \
   --game cargo run --features agent \
   --driver python3 my_driver.py
 ```
@@ -97,6 +99,8 @@ await game.close();
 
 ## Artifacts and CI
 
-`bevy-feedback run` streams logs, records `transcript.jsonl`, releases inputs, sends `shutdown`, and copies protocol `capture_dir` PNGs to `artifacts/screenshots/`. `failure-summary.txt` includes bounded server diagnostic context, log tails, and the newest capture when available.
+`bevy-feedback run` optionally runs `--prepare` with its own `--prepare-timeout`, then starts the game and begins `--protocol-timeout` at spawn. `--ready-timeout` remains a deprecated alias. Commands inherit the caller cwd; `--game-cwd` affects only the game.
+
+Every completed run writes versioned `run-summary.json` with stable result code, phase/timings, effective commands/cwd, artifacts, coarse process exit, warnings, and teardown observations. Teardown records input release, shutdown acknowledgment, socket closure, child exit, and forced termination. Forced termination fails the run; clean exit before acknowledgment is reported as a warning. `failure-summary.txt` retains bounded diagnostic context, log tails, and the newest capture.
 
 See [`docs/ci-linux.md`](docs/ci-linux.md) for `xvfb-run` and artifact upload. Windowed screenshot readback requires a usable display and is subject to window/compositor constraints.

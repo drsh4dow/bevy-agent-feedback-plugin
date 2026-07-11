@@ -24,7 +24,9 @@ bevy-feedback doctor
 Run game and driver:
 
 ```sh
-bevy-feedback run --ready-timeout 180000 \
+bevy-feedback run \
+  --prepare cargo build --features agent \
+  --game-cwd "$PWD" \
   --game cargo run --features agent \
   --driver python3 tests/drive_smoke.py
 ```
@@ -160,6 +162,7 @@ Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<arti
 | `transcript.jsonl` | replayable request/response/timing envelopes and error context |
 | `captures/` | wrapper-exported fallback live capture directory |
 | `screenshots/` | final copied PNGs |
+| `run-summary.json` | versioned result code, phase/timings, launch context, artifacts, process exit, teardown |
 | `failure-summary.txt` | failure reason, bounded diagnostic context, log tails, newest capture |
 
 The wrapper releases inputs and sends `shutdown`. Manual clients should call `BevyFeedbackClient.close()`.

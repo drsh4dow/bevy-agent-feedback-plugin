@@ -8,11 +8,15 @@ use std::{
 pub(crate) struct RunArgs {
     pub(crate) protocol_file: PathBuf,
     pub(crate) artifacts: PathBuf,
-    pub(crate) ready_timeout: Duration,
+    pub(crate) prepare_timeout: Duration,
+    pub(crate) protocol_timeout: Duration,
     pub(crate) shutdown_timeout: Duration,
     pub(crate) driver_timeout: Duration,
+    pub(crate) game_cwd: Option<PathBuf>,
+    pub(crate) prepare: Option<Vec<String>>,
     pub(crate) game: Vec<String>,
     pub(crate) driver: Option<Vec<String>>,
+    pub(crate) used_legacy_ready_timeout: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -41,20 +45,28 @@ pub(crate) fn usage() -> String {
   bevy-feedback --help
   bevy-feedback --version
   bevy-feedback doctor [--protocol FILE]
-  bevy-feedback run [--protocol FILE] [--artifacts DIR] [--ready-timeout MS] [--driver-timeout MS] [--shutdown-timeout MS] -- <game command...>
-  bevy-feedback run [--protocol FILE] [--artifacts DIR] [--ready-timeout MS] [--driver-timeout MS] [--shutdown-timeout MS] --game <game...> --driver <driver...>
+  bevy-feedback run [options] -- <game command...>
+  bevy-feedback run [options] [--prepare <prepare...>] --game <game...> [--driver <driver...>]
+
+options:
+  --prepare-timeout MS   prepare timeout (default 300000)
+  --protocol-timeout MS  protocol startup timeout after game spawn (default 60000)
+  --game-cwd DIR         working directory for the game only
+  --ready-timeout MS     deprecated alias for --protocol-timeout
 
 env:
-  BEVY_FEEDBACK_PROTOCOL            protocol file (default target/agent-feedback/agent-feedback.json)
-  BEVY_FEEDBACK_ARTIFACTS           artifact dir (default target/agent-feedback/artifacts/run-<unix-ms>)
-  BEVY_FEEDBACK_READY_TIMEOUT_MS    readiness timeout in milliseconds (default 60000)
-  BEVY_FEEDBACK_DRIVER_TIMEOUT_MS   driver timeout in milliseconds (default 300000)
-  BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS shutdown timeout in milliseconds (default 5000)
+  BEVY_FEEDBACK_PROTOCOL             protocol file (default target/agent-feedback/agent-feedback.json)
+  BEVY_FEEDBACK_ARTIFACTS            artifact dir (default target/agent-feedback/artifacts/run-<unix-ms>)
+  BEVY_FEEDBACK_PREPARE_TIMEOUT_MS   prepare timeout in milliseconds (default 300000)
+  BEVY_FEEDBACK_PROTOCOL_TIMEOUT_MS  protocol timeout in milliseconds (default 60000)
+  BEVY_FEEDBACK_READY_TIMEOUT_MS     deprecated protocol-timeout fallback
+  BEVY_FEEDBACK_DRIVER_TIMEOUT_MS    driver timeout in milliseconds (default 300000)
+  BEVY_FEEDBACK_SHUTDOWN_TIMEOUT_MS  shutdown timeout in milliseconds (default 5000)
   BEVY_FEEDBACK_CAPTURE_DIR         exported to game/driver as the capture dir
   BEVY_FEEDBACK_TRANSCRIPT          exported to game/driver as transcript.jsonl
 
 timeouts:
-  readiness 60s, driver 300s, shutdown 5s
+  prepare 300s, protocol 60s, driver 300s, shutdown 5s
 
 artifacts:
   successful runs print artifacts=<dir> and copy captured PNGs to <dir>/screenshots/
@@ -64,7 +76,7 @@ examples:
   bevy-feedback --version
   bevy-feedback doctor
   bevy-feedback run -- cargo run --example minimal
-  bevy-feedback run --ready-timeout 180000 --game cargo run --features agent --driver python3 tests/drive_camera.py
+  bevy-feedback run --prepare cargo build --features agent --game cargo run --features agent --driver python3 tests/drive_camera.py
 
 note:
   Protocol-ready is not game-ready; use skills/driving-bevy-games/SKILL.md to choose readiness and time control.
@@ -112,12 +124,27 @@ fn parse_run_args(
         .unwrap_or_else(|| {
             PathBuf::from(format!("target/agent-feedback/artifacts/run-{}", unix_ms()))
         });
-    let mut ready_timeout = default_timeout(
-        "ready timeout",
-        "BEVY_FEEDBACK_READY_TIMEOUT_MS",
-        60_000,
+    let mut prepare_timeout = default_timeout(
+        "prepare timeout",
+        "BEVY_FEEDBACK_PREPARE_TIMEOUT_MS",
+        300_000,
         get_env,
     )?;
+    let protocol_env = get_env("BEVY_FEEDBACK_PROTOCOL_TIMEOUT_MS");
+    let legacy_protocol_env = get_env("BEVY_FEEDBACK_READY_TIMEOUT_MS");
+    let mut used_legacy_ready_timeout = protocol_env.is_none() && legacy_protocol_env.is_some();
+    let mut protocol_timeout = match protocol_env.or(legacy_protocol_env) {
+        Some(value) => {
+            let value = value.into_string().map_err(|_| {
+                "protocol timeout environment value must be valid UTF-8".to_string()
+            })?;
+            parse_timeout_ms(&value, "protocol timeout")?
+        }
+        None => Duration::from_millis(60_000),
+    };
+    let mut protocol_flag_seen = false;
+    let mut ready_flag_seen = false;
+    let mut game_cwd = None;
     let mut driver_timeout = default_timeout(
         "driver timeout",
         "BEVY_FEEDBACK_DRIVER_TIMEOUT_MS",
@@ -144,9 +171,37 @@ fn parse_run_args(
                 artifacts = PathBuf::from(value);
                 index += 2;
             }
+            "--prepare-timeout" => {
+                let value = option_value(args, index, "--prepare-timeout")?;
+                prepare_timeout = parse_timeout_ms(value, "prepare timeout")?;
+                index += 2;
+            }
+            "--protocol-timeout" => {
+                if ready_flag_seen {
+                    return Err(
+                        "--protocol-timeout conflicts with deprecated --ready-timeout".to_string(),
+                    );
+                }
+                let value = option_value(args, index, "--protocol-timeout")?;
+                protocol_timeout = parse_timeout_ms(value, "protocol timeout")?;
+                protocol_flag_seen = true;
+                used_legacy_ready_timeout = false;
+                index += 2;
+            }
             "--ready-timeout" => {
+                if protocol_flag_seen {
+                    return Err(
+                        "deprecated --ready-timeout conflicts with --protocol-timeout".to_string(),
+                    );
+                }
                 let value = option_value(args, index, "--ready-timeout")?;
-                ready_timeout = parse_timeout_ms(value, "ready timeout")?;
+                protocol_timeout = parse_timeout_ms(value, "protocol timeout")?;
+                ready_flag_seen = true;
+                used_legacy_ready_timeout = true;
+                index += 2;
+            }
+            "--game-cwd" => {
+                game_cwd = Some(PathBuf::from(option_value(args, index, "--game-cwd")?));
                 index += 2;
             }
             "--driver-timeout" => {
@@ -159,14 +214,39 @@ fn parse_run_args(
                 shutdown_timeout = parse_timeout_ms(value, "shutdown timeout")?;
                 index += 2;
             }
+            "--prepare" => {
+                let rest = &args[index + 1..];
+                let Some(game_index) = rest.iter().position(|arg| arg == "--game") else {
+                    return Err("--prepare requires a following --game command".to_string());
+                };
+                if game_index == 0 {
+                    return Err("missing prepare command after '--prepare'".to_string());
+                }
+                return parse_game_driver(
+                    &rest[game_index + 1..],
+                    protocol_file,
+                    artifacts,
+                    prepare_timeout,
+                    protocol_timeout,
+                    shutdown_timeout,
+                    driver_timeout,
+                    game_cwd,
+                    Some(rest[..game_index].to_vec()),
+                    used_legacy_ready_timeout,
+                );
+            }
             "--game" => {
                 return parse_game_driver(
                     &args[index + 1..],
                     protocol_file,
                     artifacts,
-                    ready_timeout,
+                    prepare_timeout,
+                    protocol_timeout,
                     shutdown_timeout,
                     driver_timeout,
+                    game_cwd,
+                    None,
+                    used_legacy_ready_timeout,
                 );
             }
             "--" => {
@@ -177,11 +257,15 @@ fn parse_run_args(
                 return Ok(Command::Run(RunArgs {
                     protocol_file,
                     artifacts,
-                    ready_timeout,
+                    prepare_timeout,
+                    protocol_timeout,
                     shutdown_timeout,
                     driver_timeout,
+                    game_cwd,
+                    prepare: None,
                     game,
                     driver: None,
+                    used_legacy_ready_timeout,
                 }));
             }
             option if option.starts_with('-') => {
@@ -270,13 +354,18 @@ fn default_protocol_file(get_env: &impl Fn(&str) -> Option<OsString>) -> PathBuf
         .unwrap_or_else(|| PathBuf::from("target/agent-feedback/agent-feedback.json"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_game_driver(
     args: &[String],
     protocol_file: PathBuf,
     artifacts: PathBuf,
-    ready_timeout: Duration,
+    prepare_timeout: Duration,
+    protocol_timeout: Duration,
     shutdown_timeout: Duration,
     driver_timeout: Duration,
+    game_cwd: Option<PathBuf>,
+    prepare: Option<Vec<String>>,
+    used_legacy_ready_timeout: bool,
 ) -> Result<Command, String> {
     let driver_index = args.iter().position(|arg| arg == "--driver");
     let (game, driver) = match driver_index {
@@ -292,11 +381,15 @@ fn parse_game_driver(
     Ok(Command::Run(RunArgs {
         protocol_file,
         artifacts,
-        ready_timeout,
+        prepare_timeout,
+        protocol_timeout,
         shutdown_timeout,
         driver_timeout,
+        game_cwd,
+        prepare,
         game: game.to_vec(),
         driver,
+        used_legacy_ready_timeout,
     }))
 }
 
@@ -380,7 +473,7 @@ mod tests {
             .expect("args"),
         );
 
-        assert_eq!(args.ready_timeout, Duration::from_millis(120_000));
+        assert_eq!(args.protocol_timeout, Duration::from_millis(120_000));
         assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
         assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
     }
@@ -406,11 +499,74 @@ mod tests {
             .expect("args"),
         );
 
-        assert_eq!(args.ready_timeout, Duration::from_millis(120_000));
+        assert_eq!(args.protocol_timeout, Duration::from_millis(120_000));
         assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
         assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
         assert_eq!(args.game, ["cargo", "run"]);
         assert_eq!(args.driver, Some(vec!["python3".into(), "drive.py".into()]));
+    }
+
+    #[test]
+    fn parses_prepare_protocol_timeout_and_game_cwd() {
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--prepare-timeout".into(),
+                "7000".into(),
+                "--protocol-timeout".into(),
+                "8000".into(),
+                "--game-cwd".into(),
+                "/tmp/game".into(),
+                "--prepare".into(),
+                "cargo".into(),
+                "build".into(),
+                "--game".into(),
+                "target/debug/game".into(),
+                "--driver".into(),
+                "python3".into(),
+                "drive.py".into(),
+            ])
+            .expect("args"),
+        );
+
+        assert_eq!(args.prepare, Some(vec!["cargo".into(), "build".into()]));
+        assert_eq!(args.prepare_timeout, Duration::from_millis(7_000));
+        assert_eq!(args.protocol_timeout, Duration::from_millis(8_000));
+        assert_eq!(args.game_cwd, Some(PathBuf::from("/tmp/game")));
+        assert!(!args.used_legacy_ready_timeout);
+    }
+
+    #[test]
+    fn legacy_ready_timeout_is_a_deprecated_alias() {
+        let args = run_args(
+            parse_args(&[
+                "run".into(),
+                "--ready-timeout".into(),
+                "9000".into(),
+                "--".into(),
+                "game".into(),
+            ])
+            .expect("args"),
+        );
+
+        assert_eq!(args.protocol_timeout, Duration::from_millis(9_000));
+        assert!(args.used_legacy_ready_timeout);
+    }
+
+    #[test]
+    fn rejects_both_protocol_timeout_names() {
+        let error = parse_args(&[
+            "run".into(),
+            "--ready-timeout".into(),
+            "9000".into(),
+            "--protocol-timeout".into(),
+            "8000".into(),
+            "--".into(),
+            "game".into(),
+        ])
+        .expect_err("aliases must not conflict");
+
+        assert!(error.contains("conflicts"), "{error}");
     }
 
     #[test]
@@ -425,7 +581,9 @@ mod tests {
         ])
         .expect_err("zero timeout should be rejected");
 
-        assert!(error.contains("ready timeout must be a positive integer number of milliseconds"));
+        assert!(
+            error.contains("protocol timeout must be a positive integer number of milliseconds")
+        );
     }
 
     #[test]
@@ -443,7 +601,7 @@ mod tests {
             .expect("args"),
         );
 
-        assert_eq!(args.ready_timeout, Duration::from_millis(120_000));
+        assert_eq!(args.protocol_timeout, Duration::from_millis(120_000));
         assert_eq!(args.driver_timeout, Duration::from_millis(400_000));
         assert_eq!(args.shutdown_timeout, Duration::from_millis(9_000));
     }

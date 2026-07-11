@@ -50,7 +50,9 @@ export WGPU_BACKEND=vulkan   # or gl
 
 Upload `target/agent-feedback` (or `$BEVY_FEEDBACK_ARTIFACTS` when set) on failure and success when useful. Wrapper run artifacts include:
 
+- `prepare.log` when `--prepare` is used
 - `game.log`
+- `run-summary.json`
 - `protocol.json`
 - `transcript.jsonl`
 - live `captures/`
@@ -61,9 +63,11 @@ Upload `target/agent-feedback` (or `$BEVY_FEEDBACK_ARTIFACTS` when set) on failu
 
 ```sh
 xvfb-run -s '-screen 0 1280x720x24' \
-  cargo run --bin bevy-feedback -- run --ready-timeout 180000 \
+  cargo run --bin bevy-feedback -- run \
+  --prepare cargo build --example minimal \
+  --game-cwd "$PWD" \
   --game cargo run --example minimal \
   --driver python3 my_driver.py
 ```
 
-The wrapper exports `BEVY_FEEDBACK_PROTOCOL`, `BEVY_FEEDBACK_CAPTURE_DIR`, `BEVY_FEEDBACK_ARTIFACTS`, and `BEVY_FEEDBACK_TRANSCRIPT`, then releases inputs and sends `shutdown` during cleanup.
+The wrapper exports `BEVY_FEEDBACK_PROTOCOL`, `BEVY_FEEDBACK_CAPTURE_DIR`, `BEVY_FEEDBACK_ARTIFACTS`, and `BEVY_FEEDBACK_TRANSCRIPT`, then releases inputs and requests shutdown during cleanup. `run-summary.json` records acknowledgment, socket closure, child exit, and any forced termination. `--ready-timeout` is a deprecated alias for `--protocol-timeout`; prepare has a separate timeout.

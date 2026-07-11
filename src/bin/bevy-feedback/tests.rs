@@ -301,6 +301,56 @@ fn fail_run_preserves_original_failure_capture_and_log_tails() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn prepare_failures_are_typed_and_always_write_run_summary() {
+    for (name, script, timeout, code) in [
+        (
+            "nonzero",
+            "exit 7",
+            Duration::from_secs(1),
+            "prepare_nonzero_exit",
+        ),
+        (
+            "timeout",
+            "exec sleep 2",
+            Duration::from_millis(50),
+            "prepare_timeout",
+        ),
+    ] {
+        let root = temp_root(&format!("prepare-{name}"));
+        let artifacts = root.join("artifacts");
+        let args = RunArgs {
+            protocol_file: root.join("protocol.json"),
+            artifacts: artifacts.clone(),
+            prepare_timeout: timeout,
+            protocol_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_millis(50),
+            driver_timeout: Duration::from_secs(1),
+            game_cwd: None,
+            prepare: Some(vec!["sh".into(), "-c".into(), script.into()]),
+            game: vec!["game-must-not-start".into()],
+            driver: None,
+            used_legacy_ready_timeout: false,
+        };
+
+        let error = run(args).expect_err("prepare must fail");
+        let summary: Value = serde_json::from_slice(
+            &fs::read(artifacts.join("run-summary.json")).expect("run summary"),
+        )
+        .expect("summary JSON");
+
+        assert_eq!(summary["schema_version"], 1);
+        assert_eq!(summary["phase"], "prepare");
+        assert_eq!(summary["result"]["code"], code);
+        assert_eq!(summary["result"]["success"], false);
+        assert!(error.contains(code), "{error}");
+        assert!(artifacts.join("prepare.log").exists());
+        assert!(!artifacts.join("game.log").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 #[test]
 fn both_cli_failure_paths_write_focused_failure_artifacts() {
     let cases = [
@@ -391,11 +441,15 @@ fn cli_run_failure_probe() {
     let args = RunArgs {
         protocol_file: artifacts.join("live-protocol.json"),
         artifacts,
-        ready_timeout: Duration::from_secs(3),
+        prepare_timeout: Duration::from_secs(3),
+        protocol_timeout: Duration::from_secs(3),
         shutdown_timeout: Duration::from_millis(100),
         driver_timeout: Duration::from_secs(1),
+        game_cwd: None,
+        prepare: None,
         game,
         driver: None,
+        used_legacy_ready_timeout: false,
     };
 
     let error = run(args).expect_err("probe run should fail");
