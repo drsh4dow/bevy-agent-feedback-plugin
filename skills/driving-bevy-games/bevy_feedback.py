@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Python client for bevy-agent-feedback v2."""
+"""Python client for bevy-agent-feedback v3."""
 from __future__ import annotations
 
 import json
@@ -8,12 +8,14 @@ import os
 import socket
 import subprocess
 import time
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Callable, Iterable, NoReturn, Sequence
 
-PROTOCOL_VERSION = "bevy-agent-feedback/2"
+PROTOCOL_VERSION = "bevy-agent-feedback/3"
 DEFAULT_MAX_WAIT_FRAMES = 300
+DEFAULT_MAX_ABORT_PREDICATES = 16
 DEFAULT_MAX_TIME_ADVANCE_STEPS = 600
 DEFAULT_MAX_TIME_ADVANCE_SECONDS = 10.0
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -22,6 +24,35 @@ MAX_CLIENT_CHUNKS = 4096
 
 class BevyFeedbackError(RuntimeError):
     """Client, protocol, command, assertion, or OCR error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.context = context
+
+    def attach_failure_capture(self, capture: dict[str, Any]) -> None:
+        context = dict(self.context or {})
+        context["failure_capture"] = dict(capture)
+        self.context = context
+        metadata = json.dumps(capture, sort_keys=True, separators=(",", ":"))
+        self.args = (f"{self.args[0]}; failure_capture={metadata}",)
+
+
+@dataclass(frozen=True)
+class BevyFeedbackCapabilities:
+    """Immutable capabilities advertised by the running game."""
+
+    max_wait_frames: int
+    max_abort_predicates: int
+    deterministic_time: bool
+    max_time_advance_steps: int
+    max_time_advance_seconds: float
 
 
 class BevyFeedbackClient:
@@ -57,23 +88,31 @@ class BevyFeedbackClient:
         commands = protocol.get("commands")
         additive_timing = isinstance(commands, dict) and "advance_time" in commands
         self._timing_advertised = additive_timing
-        self.max_wait_frames = _protocol_positive_int(
-            protocol, "max_wait_frames", DEFAULT_MAX_WAIT_FRAMES, additive_timing
-        )
-        self.deterministic_time = _protocol_bool(
-            protocol, "deterministic_time", False, additive_timing
-        )
-        self.max_time_advance_steps = _protocol_positive_int(
-            protocol,
-            "max_time_advance_steps",
-            DEFAULT_MAX_TIME_ADVANCE_STEPS,
-            additive_timing,
-        )
-        self.max_time_advance_seconds = _protocol_positive_float(
-            protocol,
-            "max_time_advance_seconds",
-            DEFAULT_MAX_TIME_ADVANCE_SECONDS,
-            additive_timing,
+        self.capabilities = BevyFeedbackCapabilities(
+            max_wait_frames=_protocol_positive_int(
+                protocol, "max_wait_frames", DEFAULT_MAX_WAIT_FRAMES, additive_timing
+            ),
+            max_abort_predicates=_protocol_positive_int(
+                protocol,
+                "max_abort_predicates",
+                DEFAULT_MAX_ABORT_PREDICATES,
+                False,
+            ),
+            deterministic_time=_protocol_bool(
+                protocol, "deterministic_time", False, additive_timing
+            ),
+            max_time_advance_steps=_protocol_positive_int(
+                protocol,
+                "max_time_advance_steps",
+                DEFAULT_MAX_TIME_ADVANCE_STEPS,
+                additive_timing,
+            ),
+            max_time_advance_seconds=_protocol_positive_float(
+                protocol,
+                "max_time_advance_seconds",
+                DEFAULT_MAX_TIME_ADVANCE_SECONDS,
+                additive_timing,
+            ),
         )
         host, port = protocol["socket_addr"].rsplit(":", 1)
         try:
@@ -84,6 +123,26 @@ class BevyFeedbackClient:
         self._stream = self._socket.makefile("rw", encoding="utf-8")
         self._next_id = 1
         self.closed = False
+
+    @property
+    def max_wait_frames(self) -> int:
+        return self.capabilities.max_wait_frames
+
+    @property
+    def max_abort_predicates(self) -> int:
+        return self.capabilities.max_abort_predicates
+
+    @property
+    def deterministic_time(self) -> bool:
+        return self.capabilities.deterministic_time
+
+    @property
+    def max_time_advance_steps(self) -> int:
+        return self.capabilities.max_time_advance_steps
+
+    @property
+    def max_time_advance_seconds(self) -> float:
+        return self.capabilities.max_time_advance_seconds
 
     def __enter__(self) -> "BevyFeedbackClient":
         return self
@@ -142,7 +201,11 @@ class BevyFeedbackClient:
                 f"{message}; context="
                 f"{json.dumps(self.last_error_context, sort_keys=True, separators=(',', ':'))}"
             )
-        raise BevyFeedbackError(f"command failed [{error.get('code', 'error')}]: {message}")
+        raise BevyFeedbackError(
+            f"command failed [{error.get('code', 'error')}]: {message}",
+            code=error.get("code") if isinstance(error.get("code"), str) else None,
+            context=self.last_error_context,
+        )
 
     def replay_jsonl(self, path: str | os.PathLike[str]) -> list[dict[str, Any]]:
         """Replay request-only or transcript-envelope JSON-lines from disk."""
@@ -158,19 +221,10 @@ class BevyFeedbackClient:
         return responses
 
     def wait_frames(self, frames: int = 1) -> dict[str, Any]:
-        """Wait for a bounded number of app updates, chunking at the advertised cap."""
+        """Wait for a positive number of app updates in one bounded request."""
         frames = _positive_int("frames", frames)
-        cap = _positive_int("max_wait_frames", self.max_wait_frames)
-        response: dict[str, Any] = {}
-        chunks = (frames + cap - 1) // cap
-        if chunks > MAX_CLIENT_CHUNKS:
-            raise BevyFeedbackError(
-                f"wait_frames requires {chunks} chunks; maximum is {MAX_CLIENT_CHUNKS}"
-            )
-        for index in range(chunks):
-            chunk = min(frames - index * cap, cap)
-            response = self.request({"command": "wait", "frames": chunk})
-        return response
+        _wait_limit("frames", frames, self.max_wait_frames)
+        return self.request({"command": "wait", "frames": frames})
 
     def wait_seconds(
         self, seconds: float, *, max_frames: int | None = None
@@ -181,10 +235,7 @@ class BevyFeedbackClient:
         request: dict[str, Any] = {"command": "wait_seconds", "seconds": seconds}
         if max_frames is not None:
             max_frames = _positive_int("max_frames", max_frames)
-            if max_frames > self.max_wait_frames:
-                raise BevyFeedbackError(
-                    f"max_frames must not exceed advertised max_wait_frames {self.max_wait_frames}"
-                )
+            _wait_limit("max_frames", max_frames, self.max_wait_frames)
             request["max_frames"] = max_frames
         return self.request(request)
 
@@ -444,24 +495,60 @@ class BevyFeedbackClient:
         self,
         predicate: dict[str, Any],
         *,
+        abort_predicates: Sequence[dict[str, Any]] = (),
         max_frames: int | None = None,
     ) -> dict[str, Any]:
+        abort_predicates = _bounded_abort_predicates(
+            abort_predicates, self.max_abort_predicates
+        )
         request: dict[str, Any] = {
             "command": "wait_for",
             "predicate": dict(predicate),
         }
+        if abort_predicates:
+            request["abort_predicates"] = [dict(item) for item in abort_predicates]
         if max_frames is not None:
-            request["max_frames"] = _bounded_frames(
-                "max_frames", max_frames, self.max_wait_frames
-            )
-        response = self.request(request)
+            max_frames = _positive_int("max_frames", max_frames)
+            _wait_limit("max_frames", max_frames, self.max_wait_frames)
+            request["max_frames"] = max_frames
+        try:
+            response = self.request(request)
+        except BevyFeedbackError as error:
+            if error.code in ("predicate_timeout", "predicate_aborted"):
+                try:
+                    self.capture("semantic-wait-failure")
+                except Exception:
+                    pass
+                else:
+                    if self.last_capture_info is not None:
+                        error.attach_failure_capture(self.last_capture_info)
+            raise
         return self._record_observation(response)
 
     def wait_for_state(
-        self, state: str, value: Any, *, max_frames: int | None = None
+        self,
+        state: str,
+        value: Any,
+        *,
+        abort_values: Sequence[Any] = (),
+        max_frames: int | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(abort_values, Sequence) or isinstance(
+            abort_values, (str, bytes)
+        ):
+            raise BevyFeedbackError("abort_values must be a sequence")
+        if len(abort_values) > self.max_abort_predicates:
+            raise BevyFeedbackError(
+                f"abort_values has {len(abort_values)} items, but server supports "
+                f"{self.max_abort_predicates}; reduce abort values or configure "
+                "separate explicit waits"
+            )
         return self.wait_for(
             {"type": "state_equals", "state": state, "value": value},
+            abort_predicates=[
+                {"type": "state_equals", "state": state, "value": abort}
+                for abort in abort_values
+            ],
             max_frames=max_frames,
         )
 
@@ -885,6 +972,30 @@ def _bounded_frames(name: str, value: Any, cap: int) -> int:
     if value > cap:
         raise BevyFeedbackError(f"{name} must not exceed advertised max_wait_frames {cap}")
     return value
+
+
+def _wait_limit(name: str, requested: int, supported: int) -> None:
+    if requested > supported:
+        raise BevyFeedbackError(
+            f"{name}={requested} exceeds server limit {supported}; "
+            "configure AgentFeedbackConfig.max_wait_frames or issue explicit bounded requests"
+        )
+
+
+def _bounded_abort_predicates(
+    predicates: Sequence[dict[str, Any]], supported: int
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(predicates, Sequence) or isinstance(predicates, (str, bytes)):
+        raise BevyFeedbackError("abort_predicates must be a sequence of predicate mappings")
+    requested = len(predicates)
+    if requested > supported:
+        raise BevyFeedbackError(
+            f"abort_predicates has {requested} items, but server supports {supported}; "
+            "reduce abort predicates or configure separate explicit waits"
+        )
+    if any(not isinstance(predicate, dict) for predicate in predicates):
+        raise BevyFeedbackError("abort_predicates entries must be predicate mappings")
+    return tuple(predicates)
 
 
 def _positive_seconds(name: str, value: Any) -> float:

@@ -29,7 +29,7 @@
 //!     .run();
 //! ```
 //!
-//! The generated protocol file is authoritative for the v2 socket, heartbeat,
+//! The generated protocol file is authoritative for the v3 socket, heartbeat,
 //! commands, deterministic-time mode, and caps. The wire envelope remains
 //! `{"id":...,"command":...}` with responses containing `ok` and either
 //! `result` or `error`.

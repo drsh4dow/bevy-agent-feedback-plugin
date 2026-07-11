@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any, Callable
 from unittest import mock
@@ -15,7 +16,13 @@ CLIENTS_PYTHON = Path(__file__).resolve().parents[1] / "clients" / "python"
 sys.path.insert(0, str(CLIENTS_PYTHON))
 
 import bevy_feedback
-from bevy_feedback import BevyFeedbackClient, BevyFeedbackError, fail, run
+from bevy_feedback import (
+    BevyFeedbackCapabilities,
+    BevyFeedbackClient,
+    BevyFeedbackError,
+    fail,
+    run,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,13 +66,18 @@ def make_client(
     responses: list[dict[str, Any]],
     *,
     max_wait_frames: int = 300,
+    max_abort_predicates: int = 16,
     max_time_advance_steps: int = 600,
     max_time_advance_seconds: float = 10.0,
 ) -> tuple[BevyFeedbackClient, RecordingTransport]:
     client = BevyFeedbackClient.__new__(BevyFeedbackClient)
-    client.max_wait_frames = max_wait_frames
-    client.max_time_advance_steps = max_time_advance_steps
-    client.max_time_advance_seconds = max_time_advance_seconds
+    client.capabilities = BevyFeedbackCapabilities(
+        max_wait_frames=max_wait_frames,
+        max_abort_predicates=max_abort_predicates,
+        deterministic_time=False,
+        max_time_advance_steps=max_time_advance_steps,
+        max_time_advance_seconds=max_time_advance_seconds,
+    )
     client._timing_advertised = True
     client.last_capture = None
     client.last_capture_info = None
@@ -206,42 +218,28 @@ class BevyFeedbackClientCoordinateHelpersTest(unittest.TestCase):
 
 
 class BevyFeedbackClientTimingTest(unittest.TestCase):
-    def test_public_wait_is_removed_and_wait_frames_chunks_wire_wait(self) -> None:
-        responses = [
-            {"ok": True, "result": {"frame": 3}},
-            {"ok": True, "result": {"frame": 6}},
-            {"ok": True, "result": {"frame": 7}},
-        ]
-        client, transport = make_client(responses, max_wait_frames=3)
+    def test_capabilities_are_immutable(self) -> None:
+        capabilities = BevyFeedbackCapabilities(300, 16, True, 600, 10.0)
+
+        with self.assertRaisesRegex(FrozenInstanceError, "cannot assign"):
+            capabilities.max_wait_frames = 600  # type: ignore[misc]
+
+    def test_wait_frames_uses_one_request_and_rejects_oversize_before_io(self) -> None:
+        response = {"ok": True, "result": {"frame": 3}}
+        client, transport = make_client([response], max_wait_frames=3)
 
         with self.assertRaises(AttributeError):
             getattr(client, "wait")
-        self.assertEqual(client.wait_frames(7), responses[-1])
-        self.assertEqual(
-            transport.requests,
-            [
-                {"command": "wait", "frames": 3},
-                {"command": "wait", "frames": 3},
-                {"command": "wait", "frames": 1},
-            ],
-        )
+        self.assertEqual(client.wait_frames(3), response)
+        self.assertEqual(transport.requests, [{"command": "wait", "frames": 3}])
 
-        default_client, default_transport = make_client([responses[0]])
-        default_client.wait_frames()
-        self.assertEqual(
-            default_transport.requests,
-            [{"command": "wait", "frames": 1}],
-        )
-
-    def test_wait_frames_rejects_more_than_bounded_client_chunks(self) -> None:
-        client, transport = make_client([], max_wait_frames=2)
-
+        oversized, oversized_transport = make_client([], max_wait_frames=3)
         with self.assertRaisesRegex(
-            BevyFeedbackError, "requires 4097 chunks; maximum is 4096"
+            BevyFeedbackError,
+            r"frames=7 exceeds server limit 3; .*AgentFeedbackConfig.max_wait_frames.*explicit bounded requests",
         ):
-            client.wait_frames(8193)
-
-        self.assertEqual(transport.requests, [])
+            oversized.wait_frames(7)
+        self.assertEqual(oversized_transport.requests, [])
 
     def test_wait_seconds_omits_or_includes_the_requested_frame_cap(self) -> None:
         responses = [
@@ -747,6 +745,115 @@ class BevyFeedbackClientDiagnosticsTest(unittest.TestCase):
                 self.assertEqual(invoke(client), observation)
                 self.assertEqual(client.last_observation, observation)
                 self.assertEqual(transport.requests, [expected])
+
+    def test_state_abort_values_use_generic_abort_predicates(self) -> None:
+        predicate = {
+            "type": "state_equals",
+            "state": "GamePhase",
+            "value": "Playing",
+        }
+        abort = {
+            "type": "state_equals",
+            "state": "GamePhase",
+            "value": "LoadFailed",
+        }
+        observation = {"predicate": predicate, "outcome": "matched", "value": "Playing"}
+        client, transport = make_client([diagnostic_response(observation)])
+
+        self.assertEqual(
+            client.wait_for_state(
+                "GamePhase",
+                "Playing",
+                abort_values=["LoadFailed"],
+                max_frames=30,
+            ),
+            observation,
+        )
+        self.assertEqual(
+            transport.requests,
+            [{
+                "command": "wait_for",
+                "predicate": predicate,
+                "abort_predicates": [abort],
+                "max_frames": 30,
+            }],
+        )
+
+    def test_oversized_semantic_wait_fails_before_io_with_remediation(self) -> None:
+        client, transport = make_client([], max_wait_frames=3)
+
+        with self.assertRaisesRegex(
+            BevyFeedbackError,
+            r"max_frames=7 exceeds server limit 3; .*AgentFeedbackConfig.max_wait_frames.*explicit bounded requests",
+        ):
+            client.wait_for_state("GamePhase", "Playing", max_frames=7)
+
+        self.assertEqual(transport.requests, [])
+
+    def test_semantic_failure_capture_attaches_metadata_to_original_error(self) -> None:
+        failure = BevyFeedbackError(
+            "command failed [predicate_aborted]: abort predicate matched",
+            code="predicate_aborted",
+            context={"snapshot": {"frame": 42}},
+        )
+        capture = capture_response(
+            "/captures/capture-000010-semantic-wait-failure.png",
+            label="semantic-wait-failure",
+        )
+        client, _transport = make_client([])
+        requests: list[dict[str, Any]] = []
+
+        def request(payload: dict[str, Any]) -> dict[str, Any]:
+            requests.append(payload)
+            if payload["command"] == "wait_for":
+                raise failure
+            return capture
+
+        client.request = request
+        with self.assertRaises(BevyFeedbackError) as raised:
+            client.wait_for_state("GamePhase", "Playing", max_frames=3)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(
+            failure.context["failure_capture"],  # type: ignore[index]
+            capture["result"]["capture"],
+        )
+        self.assertEqual(
+            requests,
+            [
+                {
+                    "command": "wait_for",
+                    "predicate": {
+                        "type": "state_equals",
+                        "state": "GamePhase",
+                        "value": "Playing",
+                    },
+                    "max_frames": 3,
+                },
+                {"command": "capture", "label": "semantic-wait-failure"},
+            ],
+        )
+
+    def test_capture_failure_preserves_the_original_semantic_error(self) -> None:
+        failure = BevyFeedbackError(
+            "command failed [predicate_timeout]: deadline",
+            code="predicate_timeout",
+            context={"snapshot": {"frame": 3}},
+        )
+        capture_failure = BevyFeedbackError("capture failed", code="capture_failed")
+        client, _transport = make_client([])
+
+        def request(payload: dict[str, Any]) -> dict[str, Any]:
+            if payload["command"] == "wait_for":
+                raise failure
+            raise capture_failure
+
+        client.request = request
+        with self.assertRaises(BevyFeedbackError) as raised:
+            client.wait_for_state("GamePhase", "Playing", max_frames=3)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(failure.context, {"snapshot": {"frame": 3}})
 
 
 class BevyFeedbackClientPredicateAssertionsTest(unittest.TestCase):

@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 /// Runtime configuration for [`crate::AgentFeedbackPlugin`].
 ///
 /// Defaults bind to localhost on port `15712`, write `agent-feedback.json`,
-/// keep captures in `agent-feedback-captures`, and refresh a heartbeat for v2
+/// keep captures in `agent-feedback-captures`, and refresh a heartbeat for v3
 /// stale-session checks.
 #[derive(Clone, Debug, Resource)]
 pub struct AgentFeedbackConfig {

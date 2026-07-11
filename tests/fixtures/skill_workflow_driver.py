@@ -192,9 +192,13 @@ def drive(game: BevyFeedbackClient) -> None:
     assert isinstance(click_result, dict)
     click_details = click_result.get("details")
     require(
-        click_result.get("status") == "clicked_target"
+        click_result.get("status") == "input_dispatched"
         and click_result.get("mouse_position") == [320.0, 240.0]
         and isinstance(click_details, dict)
+        and click_details.get("target_resolved") is True
+        and click_details.get("input_dispatched") is True
+        and click_details.get("logical_position") == [320.0, 240.0]
+        and click_details.get("button") == "Left"
         and click_details.get("name") == "WorkflowButton"
         and click_details.get("camera_name") == "WorkflowCamera"
         and click_details.get("kind") == "ui"

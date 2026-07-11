@@ -62,8 +62,10 @@ pub(crate) fn run_rendered_contract(drive_semantic_targets: RenderDriver) {
     add_render_plugins(&mut app);
     app.add_plugins((
         AgentFeedbackPlugin::new(config),
-        AgentFeedbackDiagnosticsPlugin::default(),
+        AgentFeedbackDiagnosticsPlugin::default()
+            .with_resource_field::<GameplayPostcondition, _, _>("accepted", |value| value.accepted),
     ))
+    .init_resource::<GameplayPostcondition>()
     .insert_resource(RenderProbe {
         client_done: client_done.clone(),
         result: Some(result_sender),
@@ -118,6 +120,11 @@ struct WorldOrthoCameraFixture;
 
 #[derive(Component)]
 struct NearCameraFixture;
+
+#[derive(Resource, Default)]
+struct GameplayPostcondition {
+    accepted: bool,
+}
 
 #[derive(Resource, Default)]
 struct ClickObservation {

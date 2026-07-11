@@ -150,6 +150,7 @@ struct PendingWait {
     responder: SyncSender<AgentResponse>,
     canceled: Arc<AtomicBool>,
     predicate: Predicate,
+    abort_predicates: Vec<Predicate>,
     max_frames: u16,
     future_evaluations: u16,
 }
@@ -192,19 +193,23 @@ fn evaluate_pending_waits(world: &mut World, queue: &mut AgentDiagnosticsQueue) 
                     observed,
                 );
             }
-            Ok(observed) if wait.future_evaluations == wait.max_frames => {
-                let context = error_context(world, Some(observed));
-                let _ = wait.responder.send(AgentResponse::contextual_error(
-                    wait.id,
-                    "predicate_timeout",
-                    format!(
-                        "predicate did not match after exactly {} future evaluations",
-                        wait.max_frames
-                    ),
-                    context,
-                ));
-            }
-            Ok(_) => queue.waits.push_back(wait),
+            Ok(observed) => match matching_abort(&queue.registry, world, &wait.abort_predicates) {
+                Ok(Some(abort)) => send_abort(world, wait.responder, wait.id, abort),
+                Ok(None) if wait.future_evaluations == wait.max_frames => {
+                    let context = error_context(world, Some(observed));
+                    let _ = wait.responder.send(AgentResponse::contextual_error(
+                        wait.id,
+                        "predicate_timeout",
+                        format!(
+                            "predicate did not match after exactly {} future evaluations",
+                            wait.max_frames
+                        ),
+                        context,
+                    ));
+                }
+                Ok(None) => queue.waits.push_back(wait),
+                Err(error) => send_evaluation_error(wait.responder, wait.id, error),
+            },
             Err(error) => send_evaluation_error(wait.responder, wait.id, error),
         }
     }
@@ -246,19 +251,25 @@ fn answer_request(world: &mut World, queue: &mut AgentDiagnosticsQueue, request:
         }
         AgentCommand::WaitFor {
             predicate,
+            abort_predicates,
             max_frames,
         } => match queue.registry.evaluate(world, &predicate) {
             Ok(observed) if observed.outcome == PredicateOutcome::Matched => {
                 send_observation(world, responder, id, "predicate_matched", observed);
             }
-            Ok(_) => queue.waits.push_back(PendingWait {
-                id,
-                responder,
-                canceled,
-                predicate,
-                max_frames,
-                future_evaluations: 0,
-            }),
+            Ok(_) => match matching_abort(&queue.registry, world, &abort_predicates) {
+                Ok(Some(abort)) => send_abort(world, responder, id, abort),
+                Ok(None) => queue.waits.push_back(PendingWait {
+                    id,
+                    responder,
+                    canceled,
+                    predicate,
+                    abort_predicates,
+                    max_frames,
+                    future_evaluations: 0,
+                }),
+                Err(error) => send_evaluation_error(responder, id, error),
+            },
             Err(error) => send_evaluation_error(responder, id, error),
         },
         AgentCommand::TargetInfo {
@@ -280,7 +291,13 @@ fn answer_request(world: &mut World, queue: &mut AgentDiagnosticsQueue, request:
         } => match resolve_target(&queue.registry, world, &target, kind, camera.as_deref()) {
             Ok(target) => {
                 let position = Vec2::from_array(target.center);
-                let details = serde_json::to_value(&target).expect("resolved target serializes");
+                let mut details =
+                    serde_json::to_value(&target).expect("resolved target serializes");
+                let object = details
+                    .as_object_mut()
+                    .expect("resolved target serializes as an object");
+                object.insert("target_resolved".to_string(), Value::Bool(true));
+                object.insert("logical_position".to_string(), json!(target.center));
                 queue.resolved_clicks.push_back(ResolvedClick {
                     id,
                     responder,
@@ -303,6 +320,35 @@ fn answer_request(world: &mut World, queue: &mut AgentDiagnosticsQueue, request:
             ));
         }
     }
+}
+
+fn matching_abort(
+    registry: &PredicateRegistry,
+    world: &mut World,
+    predicates: &[Predicate],
+) -> Result<Option<ObservedPredicate>, EvaluationError> {
+    for predicate in predicates {
+        let observed = registry.evaluate(world, predicate)?;
+        if observed.outcome == PredicateOutcome::Matched {
+            return Ok(Some(observed));
+        }
+    }
+    Ok(None)
+}
+
+fn send_abort(
+    world: &mut World,
+    responder: SyncSender<AgentResponse>,
+    id: Value,
+    observed: ObservedPredicate,
+) {
+    let context = error_context(world, Some(observed));
+    let _ = responder.send(AgentResponse::contextual_error(
+        id,
+        "predicate_aborted",
+        "abort predicate matched",
+        context,
+    ));
 }
 
 fn send_observation(

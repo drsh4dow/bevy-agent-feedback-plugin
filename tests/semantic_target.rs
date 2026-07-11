@@ -231,11 +231,24 @@ fn drive_semantic_targets(
             1,
         )
         .map_err(client_error)?;
-    if click["result"]["status"] != "clicked_target"
-        || click["result"]["details"]["name"] != "MovingButton"
+    let details = &click["result"]["details"];
+    if click["result"]["status"] != "input_dispatched"
+        || details["name"] != "MovingButton"
+        || details["target_resolved"] != true
+        || details["input_dispatched"] != true
+        || details["logical_position"] != details["center"]
+        || details["button"] != "Left"
     {
         return Err(format!(
-            "named click did not retain its exact resolved target: {click}"
+            "named click did not retain resolution and dispatch evidence: {click}"
+        ));
+    }
+    let gameplay = client
+        .read_resource_field("GameplayPostcondition", "accepted")
+        .map_err(client_error)?;
+    if gameplay != bevy_agent_feedback_plugin::DiagnosticValue::Bool(false) {
+        return Err(format!(
+            "dispatch incorrectly implied a gameplay postcondition: {gameplay:?}"
         ));
     }
 

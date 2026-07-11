@@ -74,7 +74,9 @@ def main(game: BevyFeedbackClient) -> None:
 bevy_feedback.run(main)
 ```
 
-State waits support exact equality; waiting for the next state proves departure from the previous one. Resource comparisons support `eq|ne|lt|lte|gt|gte`; model absence as a registered boolean/nullable field. Markers and targets provide explicit present/absent waits. Do not invent a state-absence helper.
+State waits support exact equality and `abort_values=[...]`; generic waits accept `abort_predicates=[...]`. Success is checked first, then abort predicates in request order, then timeout. Resource comparisons support `eq|ne|lt|lte|gt|gte`; model absence as a registered boolean/nullable field. Markers and targets provide explicit present/absent waits. Do not invent a state-absence helper.
+
+Inspect immutable advertised limits through `game.capabilities`; the existing flat fields remain available. Wait helpers reject values above `max_wait_frames` before I/O with remediation. They never silently split a wait—raise the server cap or issue explicit bounded requests whose postconditions you control.
 
 Use `wait_frames(n)` only to count app updates—for input propagation or a render boundary. It is **not** elapsed gameplay time. Under normal time, `wait_seconds(seconds, max_frames=...)` observes Bevy virtual time without changing it. Frozen deterministic mode rejects `wait_seconds`; use `advance_time(seconds, step_seconds=...)`. Clients chunk deterministic advancement from advertised caps while preserving full nominal steps in non-final chunks and allowing only the final chunk to have a short remainder.
 
@@ -84,7 +86,7 @@ After semantic readiness, prefer `capture_after_frames(1)` rather than a separat
 
 ```toml
 [dependencies]
-bevy-agent-feedback-plugin = { version = "0.4", optional = true, features = ["diagnostics"] }
+bevy-agent-feedback-plugin = { version = "0.5", optional = true, features = ["diagnostics"] }
 
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
@@ -125,7 +127,7 @@ Deterministic mode freezes Bevy-managed virtual/fixed time between `advance_time
 
 ## Inputs and visual fallback
 
-Prefer semantic target waits and `click_named`/`click_accessibility_label`/`click_marker`. Use coordinates only when no semantic registration exists.
+Prefer semantic target waits and `click_named`/`click_accessibility_label`/`click_marker`. An `input_dispatched` result proves target resolution and Bevy pointer dispatch only; always follow it with a semantic gameplay postcondition. Use coordinates only when no semantic registration exists.
 
 - Input coordinates are **logical window pixels**, origin top-left.
 - PNG assertions, OCR crops, `include`, and `masks` use **physical PNG pixels**.
@@ -153,7 +155,7 @@ game.key_hold("KeyW", 45)
 
 ## Results, cleanup, troubleshooting
 
-Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<artifacts>/screenshots/`. Failures preserve bounded structured server context and latest capture metadata in `failure-summary.txt`/`transcript.jsonl`.
+Live PNGs are in the protocol file's `capture_dir`; wrapper artifacts use `<artifacts>/screenshots/`. Semantic timeout/abort helpers best-effort request `semantic-wait-failure` and attach its metadata without replacing the original error if capture fails. Failures preserve bounded structured server context and latest capture metadata in `failure-summary.txt`/`transcript.jsonl`.
 
 | path | purpose |
 |---|---|

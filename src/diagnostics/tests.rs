@@ -67,6 +67,7 @@ fn wait_for_matches_during_its_admission_evaluation() {
     };
     let (request, receiver) = request(AgentCommand::WaitFor {
         predicate: predicate.clone(),
+        abort_predicates: Vec::new(),
         max_frames: 4,
     });
     let mut world = diagnostics_world(registry, request);
@@ -99,6 +100,7 @@ fn wait_for_times_out_only_on_the_exact_future_evaluation_boundary() {
     };
     let (request, receiver) = request(AgentCommand::WaitFor {
         predicate: predicate.clone(),
+        abort_predicates: Vec::new(),
         max_frames: 2,
     });
     let mut world = diagnostics_world(registry, request);
@@ -113,6 +115,7 @@ fn wait_for_times_out_only_on_the_exact_future_evaluation_boundary() {
     answer_diagnostics(&mut world);
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 
+    world.resource_mut::<AgentFeedbackState>().frame = 17;
     answer_diagnostics(&mut world);
     let response = response_value(&receiver);
     assert_eq!(response["error"]["code"], "predicate_timeout");
@@ -128,6 +131,7 @@ fn wait_for_times_out_only_on_the_exact_future_evaluation_boundary() {
             "count": 1
         })
     );
+    assert_eq!(response["error"]["context"]["snapshot"]["frame"], 17);
     assert_eq!(
         response["error"]["context"]["ecs_summary"]["entity_count"],
         256
@@ -136,6 +140,83 @@ fn wait_for_times_out_only_on_the_exact_future_evaluation_boundary() {
         response["error"]["context"]["ecs_summary"]["entity_count_is_lower_bound"],
         true
     );
+}
+
+#[test]
+fn wait_for_success_precedes_abort_and_timeout_on_the_same_frame() {
+    let mut registry = PredicateRegistry::default();
+    registry
+        .register_marker::<TestMarker>()
+        .expect("marker registration should succeed");
+    let success = Predicate::MarkerCount {
+        marker: "TestMarker".to_string(),
+        min: Some(1),
+        max: None,
+    };
+    let abort = Predicate::MarkerCount {
+        marker: "TestMarker".to_string(),
+        min: Some(1),
+        max: None,
+    };
+    let (request, receiver) = request(AgentCommand::WaitFor {
+        predicate: success.clone(),
+        abort_predicates: vec![abort],
+        max_frames: 1,
+    });
+    let mut world = diagnostics_world(registry, request);
+
+    answer_diagnostics(&mut world);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    world.resource_mut::<AgentFeedbackState>().frame = 23;
+    world.spawn(TestMarker);
+    answer_diagnostics(&mut world);
+
+    let response = response_value(&receiver);
+    assert_eq!(response["result"]["status"], "predicate_matched");
+    assert_eq!(response["result"]["details"]["predicate"], json!(success));
+    assert_eq!(response["result"]["frame"], 23);
+}
+
+#[test]
+fn wait_for_abort_precedes_timeout_and_reports_the_exact_frame() {
+    let mut registry = PredicateRegistry::default();
+    registry
+        .register_marker::<TestMarker>()
+        .expect("marker registration should succeed");
+    let success = Predicate::MarkerCount {
+        marker: "TestMarker".to_string(),
+        min: Some(2),
+        max: None,
+    };
+    let abort = Predicate::MarkerCount {
+        marker: "TestMarker".to_string(),
+        min: Some(1),
+        max: Some(1),
+    };
+    let (request, receiver) = request(AgentCommand::WaitFor {
+        predicate: success,
+        abort_predicates: vec![abort.clone()],
+        max_frames: 1,
+    });
+    let mut world = diagnostics_world(registry, request);
+
+    answer_diagnostics(&mut world);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    world.resource_mut::<AgentFeedbackState>().frame = 42;
+    world.spawn(TestMarker);
+    answer_diagnostics(&mut world);
+
+    let response = response_value(&receiver);
+    assert_eq!(response["error"]["code"], "predicate_aborted");
+    assert_eq!(
+        response["error"]["context"]["observed_predicate"],
+        json!({
+            "predicate": abort,
+            "outcome": "matched",
+            "count": 1
+        })
+    );
+    assert_eq!(response["error"]["context"]["snapshot"]["frame"], 42);
 }
 
 #[test]

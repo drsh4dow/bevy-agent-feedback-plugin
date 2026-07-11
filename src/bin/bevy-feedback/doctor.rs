@@ -528,7 +528,7 @@ mod tests {
         let mut protocol = Map::from_iter([
             (
                 "protocol".to_string(),
-                Value::String("bevy-agent-feedback/2".to_string()),
+                Value::String("bevy-agent-feedback/3".to_string()),
             ),
             (
                 "socket_addr".to_string(),

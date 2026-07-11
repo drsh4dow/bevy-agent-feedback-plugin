@@ -1,9 +1,9 @@
-//! Rust client for the v2 agent feedback protocol.
+//! Rust client for the v3 agent feedback protocol.
 
 #[cfg(test)]
 use crate::session::PROTOCOL_VERSION;
 use crate::session::unix_ms;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -65,7 +65,7 @@ impl Default for OcrOptions {
 }
 
 /// Completion state for a captured PNG.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureCompletion {
     /// Bevy emitted `ScreenshotCaptured` after render readback.
@@ -73,7 +73,7 @@ pub enum CaptureCompletion {
 }
 
 /// Stable primary-window mode recorded with a capture.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureWindowMode {
     /// A regular window.
@@ -85,7 +85,7 @@ pub enum CaptureWindowMode {
 }
 
 /// Primary-window metadata recorded at capture request or completion time.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CaptureWindowInfo {
     /// Logical width used by input coordinates.
     pub logical_width: f32,
@@ -108,7 +108,7 @@ pub struct CaptureWindowInfo {
 }
 
 /// A captured PNG returned by the plugin.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Capture {
     /// Monotonic capture sequence number.
     pub sequence: u64,
@@ -145,6 +145,21 @@ pub struct Region {
     pub height: u32,
 }
 
+/// Immutable limits and timing behavior advertised by the running game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    /// Maximum app-update frames accepted by one request.
+    pub max_wait_frames: u16,
+    /// Maximum abort predicates accepted by one semantic wait.
+    pub max_abort_predicates: usize,
+    /// Whether deterministic Bevy time is enabled.
+    pub deterministic_time: bool,
+    /// Maximum deterministic updates accepted by one request.
+    pub max_time_advance_steps: u16,
+    /// Maximum deterministic duration accepted by one request.
+    pub max_time_advance: Duration,
+}
+
 /// Rust client for the local JSON-lines control socket.
 pub struct AgentClient {
     stream: TcpStream,
@@ -154,10 +169,7 @@ pub struct AgentClient {
     transcript: Option<File>,
     last_capture: Option<Capture>,
     ocr: OcrOptions,
-    max_wait_frames: u16,
-    deterministic_time: bool,
-    max_time_advance_steps: u16,
-    max_time_advance: Duration,
+    capabilities: AgentCapabilities,
     last_observation: Option<ObservedPredicate>,
 }
 
@@ -213,6 +225,28 @@ impl Display for ClientError {
 
 impl Error for ClientError {}
 
+impl ClientError {
+    fn is_semantic_wait_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Command { code, .. }
+                if code == "predicate_timeout" || code == "predicate_aborted"
+        )
+    }
+
+    fn attach_failure_capture(&mut self, capture: &Capture) {
+        let Self::Command { context, .. } = self else {
+            return;
+        };
+        let context = context.get_or_insert_with(|| json!({}));
+        if let Some(object) = context.as_object_mut()
+            && let Ok(capture) = serde_json::to_value(capture)
+        {
+            object.insert("failure_capture".to_string(), capture);
+        }
+    }
+}
+
 impl From<io::Error> for ClientError {
     fn from(error: io::Error) -> Self {
         Self::Io(error.to_string())
@@ -240,6 +274,11 @@ impl AgentClient {
         if protocol.max_wait_frames == 0 {
             return Err(ClientError::Protocol(
                 "protocol advertises zero max_wait_frames".to_string(),
+            ));
+        }
+        if protocol.max_abort_predicates == 0 {
+            return Err(ClientError::Protocol(
+                "protocol advertises zero max_abort_predicates".to_string(),
             ));
         }
         if protocol.max_time_advance_steps == 0 {
@@ -282,10 +321,13 @@ impl AgentClient {
             transcript,
             last_capture: None,
             ocr: config.ocr,
-            max_wait_frames: protocol.max_wait_frames,
-            deterministic_time: protocol.deterministic_time,
-            max_time_advance_steps: protocol.max_time_advance_steps,
-            max_time_advance,
+            capabilities: AgentCapabilities {
+                max_wait_frames: protocol.max_wait_frames,
+                max_abort_predicates: protocol.max_abort_predicates,
+                deterministic_time: protocol.deterministic_time,
+                max_time_advance_steps: protocol.max_time_advance_steps,
+                max_time_advance,
+            },
             last_observation: None,
         })
     }
@@ -499,6 +541,16 @@ impl AgentClient {
             Some(capture) => format!("{message}; last captured frame: {}", capture.path.display()),
             None => message,
         }
+    }
+
+    fn validate_wait_limit(&self, name: &str, requested: u64) -> Result<(), ClientError> {
+        let supported = u64::from(self.capabilities.max_wait_frames);
+        if requested > supported {
+            return Err(ClientError::Protocol(format!(
+                "{name}={requested} exceeds server limit {supported}; configure AgentFeedbackConfig.max_wait_frames or issue explicit bounded requests"
+            )));
+        }
+        Ok(())
     }
 }
 

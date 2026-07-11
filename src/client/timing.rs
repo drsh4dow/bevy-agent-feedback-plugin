@@ -5,49 +5,45 @@ use std::time::Duration;
 const MAX_CLIENT_CHUNKS: u64 = 4_096;
 
 impl AgentClient {
+    /// Immutable capabilities advertised by the running game.
+    pub fn capabilities(&self) -> &super::AgentCapabilities {
+        &self.capabilities
+    }
+
     /// Whether the running game advertised deterministic Bevy time.
     pub fn deterministic_time_enabled(&self) -> bool {
-        self.deterministic_time
+        self.capabilities.deterministic_time
     }
 
     /// Maximum app-update frames accepted by one wire request.
     pub fn max_wait_frames(&self) -> u16 {
-        self.max_wait_frames
+        self.capabilities.max_wait_frames
+    }
+
+    /// Maximum abort predicates accepted by one semantic wait.
+    pub fn max_abort_predicates(&self) -> usize {
+        self.capabilities.max_abort_predicates
     }
 
     /// Maximum deterministic updates accepted by one wire request.
     pub fn max_time_advance_steps(&self) -> u16 {
-        self.max_time_advance_steps
+        self.capabilities.max_time_advance_steps
     }
 
     /// Maximum deterministic duration accepted by one wire request.
     pub fn max_time_advance(&self) -> Duration {
-        self.max_time_advance
+        self.capabilities.max_time_advance
     }
 
-    /// Waits for a positive number of Bevy app updates using bounded wire chunks.
+    /// Waits for a positive, server-bounded number of Bevy app updates.
     pub fn wait_frames(&mut self, frames: u64) -> Result<Value, ClientError> {
         if frames == 0 {
             return Err(ClientError::Protocol(
                 "frames must be greater than zero".to_string(),
             ));
         }
-        let cap = u64::from(self.max_wait_frames);
-        let chunk_count = frames.div_ceil(cap);
-        if chunk_count > MAX_CLIENT_CHUNKS {
-            return Err(ClientError::Protocol(format!(
-                "frame wait requires {chunk_count} chunks, maximum is {MAX_CLIENT_CHUNKS}"
-            )));
-        }
-
-        let mut remaining = frames;
-        let mut response = Value::Null;
-        for _ in 0..chunk_count {
-            let chunk = remaining.min(cap);
-            response = self.request(json!({"command": "wait", "frames": chunk}))?;
-            remaining -= chunk;
-        }
-        Ok(response)
+        self.validate_wait_limit("frames", frames)?;
+        self.request(json!({"command": "wait", "frames": frames}))
     }
 
     /// Observes positive gameplay time without changing the game's clock.
@@ -57,13 +53,13 @@ impl AgentClient {
         max_frames: Option<u16>,
     ) -> Result<Value, ClientError> {
         let duration = positive_duration("seconds", seconds)?;
-        let max_frames = max_frames.unwrap_or(self.max_wait_frames);
-        if max_frames == 0 || max_frames > self.max_wait_frames {
-            return Err(ClientError::Protocol(format!(
-                "max_frames must be in 1..={}",
-                self.max_wait_frames
-            )));
+        let max_frames = max_frames.unwrap_or(self.capabilities.max_wait_frames);
+        if max_frames == 0 {
+            return Err(ClientError::Protocol(
+                "max_frames must be greater than zero".to_string(),
+            ));
         }
+        self.validate_wait_limit("max_frames", u64::from(max_frames))?;
         self.request(json!({
             "command": "wait_seconds",
             "seconds": duration.as_secs_f64(),
@@ -79,7 +75,7 @@ impl AgentClient {
     ) -> Result<Value, ClientError> {
         let duration = positive_duration("seconds", seconds)?;
         let Some(step_seconds) = step_seconds else {
-            if duration > self.max_time_advance {
+            if duration > self.capabilities.max_time_advance {
                 return Err(ClientError::Protocol(
                     "advance_time requires an explicit step_seconds when protocol caps require chunking"
                         .to_string(),
@@ -99,9 +95,9 @@ impl AgentClient {
         duration: Duration,
         step: Duration,
     ) -> Result<Value, ClientError> {
-        let cap_ns = self.max_time_advance.as_nanos();
+        let cap_ns = self.capabilities.max_time_advance.as_nanos();
         let step_ns = step.as_nanos();
-        let max_steps = u128::from(self.max_time_advance_steps);
+        let max_steps = u128::from(self.capabilities.max_time_advance_steps);
         let mut remaining_ns = duration.as_nanos();
 
         if request_fits(remaining_ns, step_ns, cap_ns, max_steps) {
@@ -169,10 +165,10 @@ impl AgentClient {
         frames: u16,
         label: Option<&str>,
     ) -> Result<Capture, ClientError> {
-        if frames == 0 || frames > self.max_wait_frames {
+        if frames == 0 || frames > self.capabilities.max_wait_frames {
             return Err(ClientError::Protocol(format!(
                 "capture frames must be in 1..={}",
-                self.max_wait_frames
+                self.capabilities.max_wait_frames
             )));
         }
         self.capture_request("capture_after_frames", frames, label)

@@ -38,7 +38,7 @@ fn assert_invalid_argument_wire(request: &str, message: &str) {
 }
 
 #[test]
-fn parses_new_commands_defaults_and_legacy_v2_wait() {
+fn parses_new_commands_defaults_and_legacy_wait_wire_name() {
     let cases = vec![
         (
             "legacy wait",
@@ -128,6 +128,7 @@ fn parses_new_commands_defaults_and_legacy_v2_wait() {
                     kind: TargetKind::Any,
                     camera: None,
                 },
+                abort_predicates: Vec::new(),
                 max_frames: 7,
             },
         ),
@@ -135,6 +136,64 @@ fn parses_new_commands_defaults_and_legacy_v2_wait() {
     for (name, request, expected) in cases {
         assert_eq!(parse_value(request), expected, "{name}");
     }
+}
+
+#[test]
+fn parses_and_bounds_generic_wait_abort_predicates() {
+    let success = Predicate::StateEquals {
+        state: "GamePhase".to_string(),
+        value: DiagnosticValue::String("Playing".to_string()),
+    };
+    let abort = Predicate::StateEquals {
+        state: "GamePhase".to_string(),
+        value: DiagnosticValue::String("LoadFailed".to_string()),
+    };
+    assert_eq!(
+        parse_value(json!({
+            "id": "abort",
+            "command": "wait_for",
+            "predicate": success,
+            "abort_predicates": [abort],
+            "max_frames": 3
+        })),
+        AgentCommand::WaitFor {
+            predicate: success,
+            abort_predicates: vec![abort],
+            max_frames: 3,
+        }
+    );
+
+    let abort_predicates = (0..=16)
+        .map(|index| {
+            json!({
+                "type": "state_equals",
+                "state": "GamePhase",
+                "value": format!("Failure{index}")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_invalid_argument(
+        json!({
+            "id": "too-many-aborts",
+            "command": "wait_for",
+            "predicate": {"type": "state_equals", "state": "GamePhase", "value": "Playing"},
+            "abort_predicates": abort_predicates
+        }),
+        "abort_predicates supports at most 16 predicates, got 17",
+    );
+    assert_invalid_argument(
+        json!({
+            "id": "invalid-abort",
+            "command": "wait_for",
+            "predicate": {"type": "state_equals", "state": "GamePhase", "value": "Playing"},
+            "abort_predicates": [{
+                "type": "state_equals",
+                "state": "GamePhase",
+                "value": ["LoadFailed"]
+            }]
+        }),
+        "value must be a null, boolean, finite number, or string scalar",
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use crate::{
     config::AgentFeedbackConfig,
+    protocol::commands::MAX_ABORT_PREDICATES,
     session::{AgentFeedbackSession, PROTOCOL_VERSION},
 };
 use serde_json::json;
@@ -58,10 +59,20 @@ pub(crate) fn write_protocol_file(
         "capture": { "label": "optional [A-Za-z0-9_-]{1,40}" },
         "capture_after_frames": { "frames": format!("required 1..={}", config.max_wait_frames), "label": "optional [A-Za-z0-9_-]{1,40}" },
         "target_info": { "target": selector.clone(), "kind": "any|ui|world; default any", "camera": "optional exact 1..=128 byte name", "requires": diagnostics_requirement },
-        "click_target": { "target": selector, "kind": "any|ui|world; default any", "camera": "optional exact 1..=128 byte name", "button": "default Left", "frames": format!("1..={}; default 1", config.max_wait_frames), "requires": diagnostics_requirement },
+        "click_target": { "target": selector, "kind": "any|ui|world; default any", "camera": "optional exact 1..=128 byte name", "button": "default Left", "frames": format!("1..={}; default 1", config.max_wait_frames), "completion": "input_dispatched with target_resolved, entity, logical_position, input_dispatched, and button evidence; gameplay acceptance is not implied", "requires": diagnostics_requirement },
         "resource_info": { "resource": "optional exact 1..=128 byte key", "field": "optional exact 1..=128 byte key", "requires": diagnostics_requirement },
         "evaluate_predicate": { "predicate": predicates.clone(), "requires": diagnostics_requirement },
-        "wait_for": { "predicate": predicates, "max_frames": format!("1..={}; default {}", config.max_wait_frames, config.max_wait_frames), "requires": diagnostics_requirement },
+        "wait_for": {
+            "predicate": predicates.clone(),
+            "abort_predicates": {
+                "optional": true,
+                "max_items": MAX_ABORT_PREDICATES,
+                "items": predicates,
+                "ordering": "success, then abort predicates in request order, then timeout",
+            },
+            "max_frames": format!("1..={}; default {}", config.max_wait_frames, config.max_wait_frames),
+            "requires": diagnostics_requirement
+        },
         "ecs_summary": { "requires": diagnostics_requirement },
         "list_entities": { "requires": diagnostics_requirement },
         "camera_info": { "requires": diagnostics_requirement },
@@ -95,6 +106,7 @@ pub(crate) fn write_protocol_file(
         "deterministic_time": config.deterministic_time,
         "max_action_steps": config.max_action_steps,
         "max_wait_frames": config.max_wait_frames,
+        "max_abort_predicates": MAX_ABORT_PREDICATES,
         "max_time_advance_steps": config.max_time_advance_steps.max(1),
         "max_time_advance_seconds": config.max_time_advance.as_secs_f64(),
         "window_modes": ["windowed", "borderless_fullscreen", "fullscreen"],

@@ -1,12 +1,12 @@
 # bevy-agent-feedback-plugin
 
-Local, bounded agent input, semantic diagnostics, deterministic Bevy time, and completion-confirmed PNG feedback for Bevy 0.19 apps over a v2 JSON-lines TCP protocol.
+Local, bounded agent input, semantic diagnostics, deterministic Bevy time, and completion-confirmed PNG feedback for Bevy 0.19 apps over a v3 JSON-lines TCP protocol.
 
 ## Install and wire
 
 ```toml
 [dependencies]
-bevy-agent-feedback-plugin = { version = "0.4", optional = true, features = ["diagnostics"] }
+bevy-agent-feedback-plugin = { version = "0.5", optional = true, features = ["diagnostics"] }
 
 [features]
 agent = ["dep:bevy-agent-feedback-plugin"]
@@ -60,21 +60,21 @@ Protocol readiness only means the socket exists; it does not prove the game is r
 
 Public clients use:
 
-- `wait_frames`: app-update progress, not gameplay elapsed time.
+- `wait_frames`: one bounded app-update request, not gameplay elapsed time; oversized waits fail before transmission.
 - `wait_seconds`: observational normal-time wait; frozen deterministic mode rejects it.
 - `advance_time`: deterministic gameplay progression, chunked only from advertised caps.
 - `wait_until_first_capture` and `capture_after_frames`: screenshot-readback-completed PNGs.
-- registered predicate waits and atomic `click_named`/accessibility-label/marker clicks.
+- registered predicate waits with generic abort predicates/state abort values, and atomic `click_named`/accessibility-label/marker input dispatch.
 
 Capture metadata includes sequence/path/label, request and completion app-update frames, PNG dimensions, request/completion window metadata, and `completion: "screenshot_captured"`. This proves Bevy screenshot readback and PNG persistence, not OS/window-compositor presentation.
 
-Raw v2 JSON-lines retains the compatibility wire command `"wait"`:
+Raw v3 JSON-lines retains the compatibility wire command `"wait"`:
 
 ```jsonl
 {"id":1,"command":"wait","frames":1}
 {"id":2,"command":"wait_seconds","seconds":0.5,"max_frames":300}
 {"id":3,"command":"advance_time","seconds":1.0,"step_seconds":0.016666667}
-{"id":4,"command":"wait_for","predicate":{"type":"state_equals","state":"AppState","value":"Playing"},"max_frames":300}
+{"id":4,"command":"wait_for","predicate":{"type":"state_equals","state":"AppState","value":"Playing"},"abort_predicates":[{"type":"state_equals","state":"AppState","value":"Failed"}],"max_frames":300}
 {"id":5,"command":"click_target","target":{"name":"Play"}}
 {"id":6,"command":"capture_after_frames","frames":1,"label":"playing"}
 ```
@@ -87,7 +87,7 @@ Input coordinates are logical primary-window pixels. PNG crop/include/mask recta
 - Python canonical source: `clients/python/bevy_feedback.py`; `bevy-feedback run` injects its byte-identical skill bundle. Use `import bevy_feedback`, `bevy_feedback.run(main)`, and `fail(...)`.
 - TypeScript: `clients/typescript/bevy_feedback.ts`, dependency-free with Node type stripping or `tsx`.
 
-All clients preserve additive protocol-v2 response fields, replay request-only or transcript-envelope JSONL, retain structured error context/latest capture metadata, and release held inputs on close.
+All clients expose an immutable advertised capabilities object while retaining flat capability fields, replay request-only or transcript-envelope JSONL, retain structured error context/latest capture metadata, and release held inputs on close. Semantic timeout/abort helpers best-effort attach a labeled failure capture. `click_target` returns `input_dispatched` resolution/dispatch evidence; it does not prove the game accepted the action.
 
 ```ts
 import { BevyFeedbackClient } from "./clients/typescript/bevy_feedback.ts";

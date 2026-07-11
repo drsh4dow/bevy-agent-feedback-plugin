@@ -302,7 +302,7 @@ impl AgentClient {
         &mut self,
         predicate: Predicate,
     ) -> Result<ObservedPredicate, ClientError> {
-        self.predicate_request("evaluate_predicate", predicate, None)
+        self.predicate_request("evaluate_predicate", predicate, None, None)
     }
 
     /// Waits for the server evaluator to report `matched`.
@@ -311,8 +311,33 @@ impl AgentClient {
         predicate: Predicate,
         max_frames: u16,
     ) -> Result<ObservedPredicate, ClientError> {
-        self.validate_frames(max_frames)?;
-        self.predicate_request("wait_for", predicate, Some(max_frames))
+        self.wait_for_with_abort(predicate, &[], max_frames)
+    }
+
+    /// Waits for a predicate while aborting on the first matching abort predicate.
+    pub fn wait_for_with_abort(
+        &mut self,
+        predicate: Predicate,
+        abort_predicates: &[Predicate],
+        max_frames: u16,
+    ) -> Result<ObservedPredicate, ClientError> {
+        self.validate_semantic_wait(max_frames, abort_predicates.len())?;
+        match self.predicate_request(
+            "wait_for",
+            predicate,
+            Some(abort_predicates),
+            Some(max_frames),
+        ) {
+            Ok(observed) => Ok(observed),
+            Err(mut error) => {
+                if error.is_semantic_wait_failure()
+                    && let Ok(capture) = self.capture_labeled("semantic-wait-failure")
+                {
+                    error.attach_failure_capture(&capture);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn wait_for_state(
@@ -321,11 +346,32 @@ impl AgentClient {
         value: DiagnosticValue,
         max_frames: u16,
     ) -> Result<ObservedPredicate, ClientError> {
-        self.wait_for(
+        self.wait_for_state_with_abort(state, value, &[], max_frames)
+    }
+
+    /// Waits for one state value and aborts on any listed value.
+    pub fn wait_for_state_with_abort(
+        &mut self,
+        state: &str,
+        value: DiagnosticValue,
+        abort_values: &[DiagnosticValue],
+        max_frames: u16,
+    ) -> Result<ObservedPredicate, ClientError> {
+        self.validate_semantic_wait(max_frames, abort_values.len())?;
+        let abort_predicates = abort_values
+            .iter()
+            .cloned()
+            .map(|value| Predicate::StateEquals {
+                state: state.to_string(),
+                value,
+            })
+            .collect::<Vec<_>>();
+        self.wait_for_with_abort(
             Predicate::StateEquals {
                 state: state.to_string(),
                 value,
             },
+            &abort_predicates,
             max_frames,
         )
     }
@@ -499,9 +545,15 @@ impl AgentClient {
         &mut self,
         command: &str,
         predicate: Predicate,
+        abort_predicates: Option<&[Predicate]>,
         max_frames: Option<u16>,
     ) -> Result<ObservedPredicate, ClientError> {
         let mut request = json!({"command": command, "predicate": predicate});
+        if let Some(abort_predicates) = abort_predicates
+            && !abort_predicates.is_empty()
+        {
+            request["abort_predicates"] = json!(abort_predicates);
+        }
         if let Some(max_frames) = max_frames {
             request["max_frames"] = Value::from(max_frames);
         }
@@ -514,10 +566,30 @@ impl AgentClient {
     }
 
     fn validate_frames(&self, frames: u16) -> Result<(), ClientError> {
-        if frames == 0 || frames > self.max_wait_frames {
+        if frames == 0 || frames > self.capabilities.max_wait_frames {
             return Err(ClientError::Protocol(format!(
                 "frames must be in 1..={}",
-                self.max_wait_frames
+                self.capabilities.max_wait_frames
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_semantic_wait(
+        &self,
+        max_frames: u16,
+        abort_predicates: usize,
+    ) -> Result<(), ClientError> {
+        if max_frames == 0 {
+            return Err(ClientError::Protocol(
+                "max_frames must be greater than zero".to_string(),
+            ));
+        }
+        self.validate_wait_limit("max_frames", u64::from(max_frames))?;
+        if abort_predicates > self.capabilities.max_abort_predicates {
+            return Err(ClientError::Protocol(format!(
+                "abort_predicates has {abort_predicates} items, but server supports {}; reduce abort predicates or configure separate explicit waits",
+                self.capabilities.max_abort_predicates
             )));
         }
         Ok(())

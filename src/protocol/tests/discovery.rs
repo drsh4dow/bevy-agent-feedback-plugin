@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::{fs, net::SocketAddr, time::Duration};
 
 #[test]
-fn writes_complete_v2_discovery_metadata() {
+fn writes_complete_v3_discovery_metadata() {
     let root =
         std::env::temp_dir().join(format!("bevy-agent-protocol-{}", crate::session::unix_ms()));
     let config = AgentFeedbackConfig {
@@ -29,7 +29,7 @@ fn writes_complete_v2_discovery_metadata() {
         serde_json::from_slice(&fs::read(&config.protocol_file).expect("protocol bytes"))
             .expect("protocol json");
 
-    assert_eq!(protocol.as_object().expect("protocol object").len(), 22);
+    assert_eq!(protocol.as_object().expect("protocol object").len(), 23);
     for (key, expected) in [
         ("protocol", json!(PROTOCOL_VERSION)),
         ("session_id", json!(session.session_id)),
@@ -56,6 +56,7 @@ fn writes_complete_v2_discovery_metadata() {
         ("deterministic_time", json!(true)),
         ("max_action_steps", json!(3)),
         ("max_wait_frames", json!(7)),
+        ("max_abort_predicates", json!(16)),
         ("max_time_advance_steps", json!(4)),
         ("max_time_advance_seconds", json!(3.0)),
         (
@@ -97,7 +98,7 @@ fn writes_complete_v2_discovery_metadata() {
     );
     assert_command(
         "click_target",
-        r#"{"target":{"exactly_one":["name","accessibility_label","marker"],"string_bytes":"1..=128"},"kind":"any|ui|world; default any","camera":"optional exact 1..=128 byte name","button":"default Left","frames":"1..=7; default 1","requires":"diagnostics feature and AgentFeedbackDiagnosticsPlugin"}"#,
+        r#"{"target":{"exactly_one":["name","accessibility_label","marker"],"string_bytes":"1..=128"},"kind":"any|ui|world; default any","camera":"optional exact 1..=128 byte name","button":"default Left","frames":"1..=7; default 1","completion":"input_dispatched with target_resolved, entity, logical_position, input_dispatched, and button evidence; gameplay acceptance is not implied","requires":"diagnostics feature and AgentFeedbackDiagnosticsPlugin"}"#,
     );
     assert_command(
         "resource_info",
@@ -112,7 +113,17 @@ fn writes_complete_v2_discovery_metadata() {
     );
     assert_eq!(
         commands["wait_for"],
-        json!({"predicate": predicates, "max_frames": "1..=7; default 7", "requires": requirement})
+        json!({
+            "predicate": predicates.clone(),
+            "abort_predicates": {
+                "optional": true,
+                "max_items": 16,
+                "items": predicates,
+                "ordering": "success, then abort predicates in request order, then timeout"
+            },
+            "max_frames": "1..=7; default 7",
+            "requires": requirement
+        })
     );
     assert_eq!(
         protocol["examples"],

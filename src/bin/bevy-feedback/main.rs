@@ -207,7 +207,7 @@ fn remember_transcript_context(
     let diagnostic_status = matches!(
         status,
         "target_info"
-            | "clicked_target"
+            | "input_dispatched"
             | "resource_info"
             | "predicate_evaluated"
             | "predicate_matched"

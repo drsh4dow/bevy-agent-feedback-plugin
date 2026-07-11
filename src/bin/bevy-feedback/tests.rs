@@ -557,7 +557,7 @@ fn cli_fake_game_probe() {
     fs::write(
         &protocol_file,
         serde_json::to_vec(&serde_json::json!({
-            "protocol": "bevy-agent-feedback/2",
+            "protocol": "bevy-agent-feedback/3",
             "session_id": "dead-game-probe",
             "pid": std::process::id(),
             "heartbeat_file": heartbeat,

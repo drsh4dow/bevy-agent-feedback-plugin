@@ -33,10 +33,15 @@ pub(super) fn run_pending_action(
                 state,
             ) {
                 Ok(info) => {
-                    if let Some(details) = action.details.take() {
+                    if let Some(mut details) = action.details.take() {
+                        let object = details
+                            .as_object_mut()
+                            .expect("resolved target details are an object");
+                        object.insert("input_dispatched".to_string(), Value::Bool(true));
+                        object.insert("button".to_string(), Value::from(format!("{button:?}")));
                         let _ = action.responder.send(AgentResponse::details_with_context(
                             action.id.clone(),
-                            "clicked_target",
+                            "input_dispatched",
                             state.latest_capture.clone(),
                             snapshot(state, Some(info)),
                             details,

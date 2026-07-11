@@ -16,6 +16,8 @@ pub(super) struct ProtocolFile {
     stale_after_ms: u64,
     #[serde(default = "default_max_wait_frames")]
     pub(super) max_wait_frames: u16,
+    #[serde(default = "default_max_abort_predicates")]
+    pub(super) max_abort_predicates: usize,
     #[serde(default)]
     pub(super) deterministic_time: bool,
     #[serde(default = "default_max_time_advance_steps")]
@@ -25,11 +27,16 @@ pub(super) struct ProtocolFile {
 }
 
 const DEFAULT_MAX_WAIT_FRAMES: u16 = 300;
+const DEFAULT_MAX_ABORT_PREDICATES: usize = 16;
 const DEFAULT_MAX_TIME_ADVANCE_STEPS: u16 = 600;
 const DEFAULT_MAX_TIME_ADVANCE_SECONDS: f64 = 10.0;
 
 fn default_max_wait_frames() -> u16 {
     DEFAULT_MAX_WAIT_FRAMES
+}
+
+fn default_max_abort_predicates() -> usize {
+    DEFAULT_MAX_ABORT_PREDICATES
 }
 
 fn default_max_time_advance_steps() -> u16 {

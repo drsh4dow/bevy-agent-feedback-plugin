@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
 import * as net from "node:net";
 
-const PROTOCOL_VERSION = "bevy-agent-feedback/2";
+const PROTOCOL_VERSION = "bevy-agent-feedback/3";
 const DEFAULT_MAX_WAIT_FRAMES = 300;
+const DEFAULT_MAX_ABORT_PREDICATES = 16;
 const NANOSECONDS_PER_SECOND = 1_000_000_000n;
 const MAX_CLIENT_CHUNKS = 4_096;
 const MAX_RESPONSE_BUFFER_BYTES = 8 * 1024 * 1024;
@@ -71,6 +72,14 @@ export interface BevyFeedbackConfig {
   transcriptFile?: string;
 }
 
+export interface BevyFeedbackCapabilities {
+  readonly maxWaitFrames: number;
+  readonly maxAbortPredicates: number;
+  readonly deterministicTime: boolean;
+  readonly maxTimeAdvanceSteps: number;
+  readonly maxTimeAdvanceSeconds: number;
+}
+
 export interface TargetOptions {
   kind?: TargetKind;
   camera?: string;
@@ -83,7 +92,7 @@ export interface ClickTargetOptions extends TargetOptions {
 
 export class BevyFeedbackError extends Error {
   readonly code?: string;
-  readonly context?: JsonObject;
+  context?: JsonObject;
 
   constructor(message: string, code?: string, context?: JsonObject) {
     super(message);
@@ -107,10 +116,7 @@ export class BevyFeedbackClient {
   private readonly ready: Promise<void>;
   private readonly timeoutMs: number;
   private readonly transcriptFile?: string;
-  readonly deterministicTime: boolean;
-  readonly maxWaitFrames: number;
-  readonly maxTimeAdvanceSteps: number;
-  readonly maxTimeAdvanceSeconds: number;
+  readonly capabilities: Readonly<BevyFeedbackCapabilities>;
   private buffer = "";
   private nextId = 1;
   private closed = false;
@@ -131,15 +137,21 @@ export class BevyFeedbackClient {
     if (typeof protocol.deterministic_time !== "boolean") {
       throw new BevyFeedbackError("protocol missing deterministic_time");
     }
-    this.deterministicTime = protocol.deterministic_time;
-    this.maxWaitFrames = protocolPositiveInteger(
-      protocol,
-      "max_wait_frames",
-      DEFAULT_MAX_WAIT_FRAMES,
-    );
-    this.maxTimeAdvanceSteps = protocolPositiveInteger(protocol, "max_time_advance_steps");
-    this.maxTimeAdvanceSeconds = protocolPositiveNumber(protocol, "max_time_advance_seconds");
-
+    this.capabilities = Object.freeze({
+      deterministicTime: protocol.deterministic_time,
+      maxWaitFrames: protocolPositiveInteger(
+        protocol,
+        "max_wait_frames",
+        DEFAULT_MAX_WAIT_FRAMES,
+      ),
+      maxAbortPredicates: protocolPositiveInteger(
+        protocol,
+        "max_abort_predicates",
+        DEFAULT_MAX_ABORT_PREDICATES,
+      ),
+      maxTimeAdvanceSteps: protocolPositiveInteger(protocol, "max_time_advance_steps"),
+      maxTimeAdvanceSeconds: protocolPositiveNumber(protocol, "max_time_advance_seconds"),
+    });
     const { host, port } = parseSocketAddr(String(protocol.socket_addr));
     this.socket = net.createConnection({ host, port });
     this.socket.setEncoding("utf8");
@@ -150,6 +162,26 @@ export class BevyFeedbackClient {
     this.socket.on("data", (data) => this.receive(data));
     this.socket.on("close", () => this.rejectPending("agent socket closed"));
     this.socket.on("error", (error) => this.rejectPending(error.message));
+  }
+
+  get deterministicTime(): boolean {
+    return this.capabilities.deterministicTime;
+  }
+
+  get maxWaitFrames(): number {
+    return this.capabilities.maxWaitFrames;
+  }
+
+  get maxAbortPredicates(): number {
+    return this.capabilities.maxAbortPredicates;
+  }
+
+  get maxTimeAdvanceSteps(): number {
+    return this.capabilities.maxTimeAdvanceSteps;
+  }
+
+  get maxTimeAdvanceSeconds(): number {
+    return this.capabilities.maxTimeAdvanceSeconds;
   }
 
   async request(request: JsonObject): Promise<JsonObject> {
@@ -222,16 +254,10 @@ export class BevyFeedbackClient {
     return responses;
   }
 
-  async waitFrames(frames = 1): Promise<JsonObject> {
-    const total = positiveInteger("frames", frames);
-    const chunkCount = Math.ceil(total / this.maxWaitFrames);
-    boundedChunkCount(chunkCount);
-    let response: JsonObject = {};
-    for (let index = 0; index < chunkCount; index += 1) {
-      const chunk = Math.min(total - index * this.maxWaitFrames, this.maxWaitFrames);
-      response = await this.request({ command: "wait", frames: chunk });
-    }
-    return response;
+  waitFrames(frames = 1): Promise<JsonObject> {
+    const requested = positiveInteger("frames", frames);
+    waitLimit("frames", requested, this.maxWaitFrames);
+    return this.request({ command: "wait", frames: requested });
   }
 
   waitSeconds(seconds: number, maxFrames?: number): Promise<JsonObject> {
@@ -240,7 +266,9 @@ export class BevyFeedbackClient {
       seconds: positiveNumber("seconds", seconds),
     };
     if (maxFrames !== undefined) {
-      request.max_frames = boundedFrames("maxFrames", maxFrames, this.maxWaitFrames);
+      const requested = positiveInteger("maxFrames", maxFrames);
+      waitLimit("maxFrames", requested, this.maxWaitFrames);
+      request.max_frames = requested;
     }
     return this.request(request);
   }
@@ -422,24 +450,76 @@ export class BevyFeedbackClient {
     );
   }
 
-  async waitFor(predicate: Predicate, maxFrames?: number): Promise<ObservedPredicate> {
+  async waitFor(
+    predicate: Predicate,
+    maxFrames?: number,
+    abortPredicates: readonly Predicate[] = [],
+  ): Promise<ObservedPredicate> {
     validatePredicate(predicate);
+    if (abortPredicates.length > this.maxAbortPredicates) {
+      throw new BevyFeedbackError(
+        `abortPredicates has ${abortPredicates.length} items, but server supports ${this.maxAbortPredicates}; reduce abort predicates or configure separate explicit waits`,
+      );
+    }
+    for (const abortPredicate of abortPredicates) {
+      validatePredicate(abortPredicate);
+    }
     const request: JsonObject = {
       command: "wait_for",
       predicate: predicate as unknown as Json,
     };
-    if (maxFrames !== undefined) {
-      request.max_frames = boundedFrames("maxFrames", maxFrames, this.maxWaitFrames);
+    if (abortPredicates.length > 0) {
+      request.abort_predicates = abortPredicates as unknown as Json;
     }
-    return this.recordObservation(await this.request(request));
+    if (maxFrames !== undefined) {
+      const requested = positiveInteger("maxFrames", maxFrames);
+      waitLimit("maxFrames", requested, this.maxWaitFrames);
+      request.max_frames = requested;
+    }
+    try {
+      return this.recordObservation(await this.request(request));
+    } catch (error) {
+      if (
+        error instanceof BevyFeedbackError &&
+        (error.code === "predicate_timeout" || error.code === "predicate_aborted")
+      ) {
+        try {
+          await this.capture("semantic-wait-failure");
+          if (this.lastCaptureInfo !== undefined) {
+            error.context = {
+              ...(error.context ?? {}),
+              failure_capture: this.lastCaptureInfo as unknown as Json,
+            };
+            error.message += `; failure_capture=${JSON.stringify(this.lastCaptureInfo)}`;
+          }
+        } catch {
+          // Best effort: preserve the semantic error.
+        }
+      }
+      throw error;
+    }
   }
 
   waitForState(
     state: string,
     value: DiagnosticValue,
     maxFrames?: number,
+    abortValues: readonly DiagnosticValue[] = [],
   ): Promise<ObservedPredicate> {
-    return this.waitFor({ type: "state_equals", state, value }, maxFrames);
+    if (abortValues.length > this.maxAbortPredicates) {
+      throw new BevyFeedbackError(
+        `abortValues has ${abortValues.length} items, but server supports ${this.maxAbortPredicates}; reduce abort values or configure separate explicit waits`,
+      );
+    }
+    return this.waitFor(
+      { type: "state_equals", state, value },
+      maxFrames,
+      abortValues.map((abortValue) => ({
+        type: "state_equals",
+        state,
+        value: abortValue,
+      })),
+    );
   }
 
   waitForResource(
@@ -753,6 +833,14 @@ function boundedFrames(name: string, value: number, cap: number): number {
   return frames;
 }
 
+function waitLimit(name: string, requested: number, supported: number): void {
+  if (requested > supported) {
+    throw new BevyFeedbackError(
+      `${name}=${requested} exceeds server limit ${supported}; configure AgentFeedbackConfig.max_wait_frames or issue explicit bounded requests`,
+    );
+  }
+}
+
 function protocolPositiveInteger(protocol: JsonObject, field: string, fallback?: number): number {
   const value = protocol[field] ?? fallback;
   if (typeof value !== "number") {
@@ -841,7 +929,12 @@ function targetPredicate(
   options: TargetOptions,
 ): Predicate {
   validateTarget(target);
-  const predicate: Predicate = { type, target };
+  const predicate: {
+    type: "target_exists" | "target_absent";
+    target: TargetSelector;
+    kind?: TargetKind;
+    camera?: string;
+  } = { type, target };
   if (options.kind !== undefined) {
     predicate.kind = options.kind;
   }

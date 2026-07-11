@@ -10,6 +10,8 @@ use validation::{
     validate_step_count, vec2,
 };
 
+pub(crate) const MAX_ABORT_PREDICATES: usize = 16;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AgentCommand {
     KeyDown(KeyCode),
@@ -94,6 +96,7 @@ pub(crate) enum AgentCommand {
     },
     WaitFor {
         predicate: Predicate,
+        abort_predicates: Vec<Predicate>,
         max_frames: u16,
     },
     EcsSummary,
@@ -302,6 +305,8 @@ enum WireCommand {
     },
     WaitFor {
         predicate: WirePredicate,
+        #[serde(default)]
+        abort_predicates: Vec<WirePredicate>,
         max_frames: Option<u16>,
     },
     EcsSummary,
@@ -552,15 +557,28 @@ fn parse_wire_command(command: WireCommand, limits: ParseLimits) -> Result<Agent
         },
         WireCommand::WaitFor {
             predicate,
+            abort_predicates,
             max_frames,
-        } => AgentCommand::WaitFor {
-            predicate: parse_predicate(predicate)?,
-            max_frames: bounded_frames(
-                "max_frames",
-                max_frames.unwrap_or(limits.max_wait_frames),
-                limits.max_wait_frames,
-            )?,
-        },
+        } => {
+            if abort_predicates.len() > MAX_ABORT_PREDICATES {
+                return Err(format!(
+                    "abort_predicates supports at most {MAX_ABORT_PREDICATES} predicates, got {}",
+                    abort_predicates.len()
+                ));
+            }
+            AgentCommand::WaitFor {
+                predicate: parse_predicate(predicate)?,
+                abort_predicates: abort_predicates
+                    .into_iter()
+                    .map(parse_predicate)
+                    .collect::<Result<Vec<_>, _>>()?,
+                max_frames: bounded_frames(
+                    "max_frames",
+                    max_frames.unwrap_or(limits.max_wait_frames),
+                    limits.max_wait_frames,
+                )?,
+            }
+        }
         WireCommand::EcsSummary => AgentCommand::EcsSummary,
         WireCommand::ListEntities => AgentCommand::ListEntities,
         WireCommand::CameraInfo => AgentCommand::CameraInfo,

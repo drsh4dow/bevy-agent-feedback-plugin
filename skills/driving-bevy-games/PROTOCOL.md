@@ -1,4 +1,4 @@
-# bevy-agent-feedback protocol v2 reference
+# bevy-agent-feedback protocol v3 reference
 
 Offline wire reference for `bevy-agent-feedback-plugin`. The running app's protocol file is authoritative: inspect its live `commands`, examples, timing mode, and caps rather than guessing.
 
@@ -15,13 +15,14 @@ Protocol-file fields:
 
 | field | meaning |
 |---|---|
-| `protocol` | exactly `bevy-agent-feedback/2` |
+| `protocol` | exactly `bevy-agent-feedback/3` |
 | `socket_addr`, `session_id`, `pid`, `started_at_unix_ms` | endpoint and session identity |
 | `heartbeat_file`, `heartbeat_interval_ms`, `stale_after_ms` | liveness; PID and fresh heartbeat are both required |
 | `capture_dir` | persisted PNG directory |
 | `coordinates` | logical primary-window input pixels, origin top-left |
 | `deterministic_time` | whether Bevy virtual/fixed time is frozen between explicit advances |
 | `max_wait_frames`, `max_action_steps` | per-request app-update/action caps |
+| `max_abort_predicates` | abort predicates accepted by one semantic wait; fixed at 16 |
 | `max_time_advance_steps`, `max_time_advance_seconds` | deterministic per-request caps; defaults 600 and 10 seconds |
 | `command_timeout_ms` | default 10,000 ms |
 | `window_modes` | `windowed`, `borderless_fullscreen`, `fullscreen` |
@@ -34,7 +35,7 @@ Other defaults: `max_wait_frames=300`, `max_action_steps=120`, retained captures
 
 Input (`cursor_move`, `click`, `drag`, semantic target centers) uses **logical window coordinates**. Capture image dimensions and image-helper `include`/`masks`/OCR regions use **physical PNG pixels**. Convert with capture `scale_factor`; recompute after a resize or scale-factor change.
 
-`frames` counts plugin **app updates**, not compositor-presented frames and not elapsed gameplay time. `wait_frames` is the public-client name; it emits the compatibility wire command `"wait"`. Bevy screenshot readback completion does not prove the OS/window compositor presented the frame.
+`frames` counts plugin **app updates**, not compositor-presented frames and not elapsed gameplay time. `wait_frames` is the public-client name; it emits one compatibility wire command `"wait"`. Clients reject values above `max_wait_frames` before transmission; waits are never silently chunked. Bevy screenshot readback completion does not prove the OS/window compositor presented the frame.
 
 ## Exact lifecycle/timing/capture JSON
 
@@ -109,13 +110,13 @@ Exact requests:
 {"id":21,"command":"click_target","target":{"accessibility_label":"Play"},"kind":"ui","button":"Left","frames":1}
 {"id":22,"command":"resource_info","resource":"RoundStats","field":"score"}
 {"id":23,"command":"evaluate_predicate","predicate":{"type":"state_equals","state":"AppState","value":"Playing"}}
-{"id":24,"command":"wait_for","predicate":{"type":"resource_field","resource":"RoundStats","field":"score","operator":"gte","value":10},"max_frames":300}
+{"id":24,"command":"wait_for","predicate":{"type":"resource_field","resource":"RoundStats","field":"score","operator":"gte","value":10},"abort_predicates":[{"type":"state_equals","state":"AppState","value":"Failed"}],"max_frames":300}
 {"id":25,"command":"wait_for","predicate":{"type":"marker_count","marker":"Enemy","min":1},"max_frames":300}
 {"id":26,"command":"wait_for","predicate":{"type":"target_exists","target":{"marker":"Clickable"},"kind":"any"},"max_frames":300}
 {"id":27,"command":"wait_for","predicate":{"type":"target_absent","target":{"name":"BlockingModal"},"kind":"any"},"max_frames":300}
 ```
 
-Target selector has **exactly one** of `name`, `accessibility_label`, or registered `marker`. `kind?` is `any` (default), `ui`, or `world`; `camera?` is an exact camera Name. `click_target` resolves and clicks atomically. Exact duplicate matches return `ambiguous_target` with at most 16 candidate details and `candidate_details_truncated` when needed; they never select the first. A definitive miss after scanning at most 256 entities returns `target_not_found`; if the cap prevents a definitive miss, `target_search_truncated` reports a candidate-count lower bound. UI targets require visible, unclipped layout bounds. World targets require a unique active compatible camera and successful viewport projection.
+Target selector has **exactly one** of `name`, `accessibility_label`, or registered `marker`. `kind?` is `any` (default), `ui`, or `world`; `camera?` is an exact camera Name. `click_target` resolves and dispatches pointer input atomically. Its completion status is `input_dispatched`; details include `target_resolved`, `entity`, `logical_position`, `input_dispatched`, `button`, and resolved target metadata. This proves resolution and Bevy input dispatch, not that gameplay accepted the action—follow interactions with a semantic postcondition. Exact duplicate matches return `ambiguous_target` with at most 16 candidate details and `candidate_details_truncated` when needed; they never select the first. A definitive miss after scanning at most 256 entities returns `target_not_found`; if the cap prevents a definitive miss, `target_search_truncated` reports a candidate-count lower bound. UI targets require visible, unclipped layout bounds. World targets require a unique active compatible camera and successful viewport projection.
 
 Predicate forms:
 
@@ -124,14 +125,16 @@ Predicate forms:
 - `marker_count`: exact registered `marker`; at least one of u32 `min`/`max`.
 - `target_exists` / `target_absent`: target selector plus optional kind/camera.
 
-Only outcome `matched` satisfies a wait. Marker scans cap at 256. If `count_is_lower_bound=true`, a minimum can still match when proven, but a maximum/absence that cannot be proven is `indeterminate`, never a false match. Target absence is likewise indeterminate after a truncated search.
+Only outcome `matched` satisfies a wait. `abort_predicates` is optional and accepts at most the advertised `max_abort_predicates`; every entry uses the same generic predicate schema. Each evaluation pass checks the success predicate first, then abort predicates in request order, then timeout. A success therefore wins when success, abort, and timeout coincide. A matching abort returns `predicate_aborted` with its observation and the exact snapshot frame. State helpers convert `abort_values` into generic `state_equals` abort predicates; there is no state-only wire path.
+
+Marker scans cap at 256. If `count_is_lower_bound=true`, a minimum can still match when proven, but a maximum/absence that cannot be proven is `indeterminate`, never a false match. Target absence is likewise indeterminate after a truncated search.
 
 Legacy diagnostic commands remain: `ecs_summary`; `list_entities` (256 cap); `camera_info` (32 cap); registered `state_info`; registered `marker_info`. Their `truncated` and `*_is_lower_bound` flags mean totals are not exact.
 
 ## Errors and completion context
 
-Common codes include `invalid_request`, `invalid_argument`, `line_too_long`, `queue_full`, `closed`, `timeout`, `missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`, `diagnostics_unavailable`, `ambiguous_target`, `target_search_truncated`, `target_not_found`, timing-state errors, and `socket_error`.
+Common codes include `invalid_request`, `invalid_argument`, `line_too_long`, `queue_full`, `closed`, `timeout`, `predicate_timeout`, `predicate_aborted`, `missing_window`, `position_out_of_bounds`, `capture_dir`, `capture_failed`, `diagnostics_unavailable`, `ambiguous_target`, `target_search_truncated`, `target_not_found`, timing-state errors, and `socket_error`.
 
-Errors may carry bounded `context.latest_capture`, `snapshot`, `timing`, `observed_predicate`, `ecs_summary`, and `diagnostic` details. Clients retain the latest capture and predicate observation; failure artifacts expose this context rather than reinterpreting it.
+Errors may carry bounded `context.latest_capture`, `snapshot`, `timing`, `observed_predicate`, `ecs_summary`, and `diagnostic` details. After `predicate_timeout` or `predicate_aborted`, client wait helpers best-effort request a `semantic-wait-failure` capture and attach its metadata as `failure_capture` on the original error. Capture failure never replaces the semantic error.
 
 An invalid key/button name returns `invalid_request` with a suggestion. `position_out_of_bounds` reports the point and logical window size. On Wayland, cursor commands write synthetic state directly into Bevy's `Window`; OS cursor warping is not required.
