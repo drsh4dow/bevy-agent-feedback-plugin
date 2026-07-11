@@ -19,3 +19,17 @@ Run format/linting/tests after changes
 
 Be extremely concise. Sacrifice grammar for the sake of concision.
 Less text, less code, is always better than more.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical default triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context layout. See `docs/agents/domain.md`.
