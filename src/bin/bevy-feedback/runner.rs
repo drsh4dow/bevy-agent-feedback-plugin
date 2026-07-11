@@ -384,10 +384,7 @@ fn run_lifecycle(
         .unwrap_or_else(|| wrapper_capture_dir.to_path_buf());
 
     let driver_started = Instant::now();
-    let mut primary_failure = match args.required_window_size {
-        Some(required) => inspect_window_contract(args, transcript_file, required, summary).err(),
-        None => None,
-    };
+    let mut primary_failure = inspect_window(args, transcript_file, summary).err();
     if primary_failure.is_none()
         && let (Some(driver_command), Some(log_path)) = (&args.driver, driver_log_path)
     {
@@ -468,10 +465,9 @@ fn run_lifecycle(
     Ok(())
 }
 
-fn inspect_window_contract(
+fn inspect_window(
     args: &RunArgs,
     transcript_file: &Path,
-    required: RequiredWindowSize,
     summary: &mut RunSummary,
 ) -> Result<(), RunFailure> {
     let config = AgentClientConfig {
@@ -480,24 +476,34 @@ fn inspect_window_contract(
         timeout: Duration::from_secs(2),
         ..Default::default()
     };
-    let response = AgentClient::with_config(config)
-        .and_then(|mut client| client.window_info())
-        .map_err(|error| RunFailure {
-            phase: "environment",
-            code: "window_size_unavailable",
-            message: format!("could not observe the primary window: {error}"),
-        })?;
-    let actual = serde_json::from_value::<CaptureWindowInfo>(response["result"]["window"].clone())
-        .map_err(|error| RunFailure {
-            phase: "environment",
-            code: "window_size_unavailable",
-            message: format!("primary window dimensions were invalid: {error}"),
-        })?;
-    println!("{}", window_diagnostic(required, &actual));
-    let matches = actual.logical_width == required.width as f32
-        && actual.logical_height == required.height as f32;
+    let response =
+        match AgentClient::with_config(config).and_then(|mut client| client.window_info()) {
+            Ok(response) => response,
+            Err(error) => {
+                return unavailable_window(
+                    format!("could not observe the primary window: {error}"),
+                    args.required_window_size.is_some(),
+                    summary,
+                );
+            }
+        };
+    let actual =
+        match serde_json::from_value::<CaptureWindowInfo>(response["result"]["window"].clone()) {
+            Ok(actual) => actual,
+            Err(error) => {
+                return unavailable_window(
+                    format!("primary window dimensions were invalid: {error}"),
+                    args.required_window_size.is_some(),
+                    summary,
+                );
+            }
+        };
+    println!("{}", window_diagnostic(args.required_window_size, &actual));
     summary.window.actual = Some(actual.clone());
-    if !matches {
+    if let Some(required) = args.required_window_size
+        && (actual.logical_width != required.width as f32
+            || actual.logical_height != required.height as f32)
+    {
         return Err(RunFailure {
             phase: "environment",
             code: "window_size_mismatch",
@@ -510,11 +516,30 @@ fn inspect_window_contract(
     Ok(())
 }
 
-fn window_diagnostic(required: RequiredWindowSize, actual: &CaptureWindowInfo) -> String {
+fn unavailable_window(
+    message: String,
+    required: bool,
+    summary: &mut RunSummary,
+) -> Result<(), RunFailure> {
+    if required {
+        return Err(RunFailure {
+            phase: "environment",
+            code: "window_size_unavailable",
+            message,
+        });
+    }
+    eprintln!("bevy-feedback: warning: {message}");
+    summary.warnings.push(message);
+    Ok(())
+}
+
+fn window_diagnostic(required: Option<RequiredWindowSize>, actual: &CaptureWindowInfo) -> String {
+    let required = required
+        .map(|size| format!("{}x{}", size.width, size.height))
+        .unwrap_or_else(|| "none".to_string());
     format!(
-        "bevy-feedback window: required_logical={}x{} actual_logical={}x{} actual_physical={}x{} scale_factor={}",
-        required.width,
-        required.height,
+        "bevy-feedback window: required_logical={} actual_logical={}x{} actual_physical={}x{} scale_factor={}",
+        required,
         actual.logical_width,
         actual.logical_height,
         actual.physical_width,

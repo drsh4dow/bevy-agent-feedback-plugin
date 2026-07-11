@@ -3,6 +3,65 @@ use std::net::TcpListener;
 
 #[test]
 fn mismatch_is_stable_and_records_required_and_actual_dimensions() {
+    let required = RequiredWindowSize {
+        width: 1280,
+        height: 720,
+    };
+    let (root, args, mut summary, server) = window_fixture(Some(required));
+
+    let failure = inspect_window(&args, &root.join("transcript.jsonl"), &mut summary)
+        .expect_err("window must mismatch");
+    server.join().expect("server");
+
+    assert_eq!(failure.code, "window_size_mismatch");
+    assert_eq!(
+        failure.message,
+        "required logical window 1280x720, observed 955x1170"
+    );
+    let actual = summary.window.actual.as_ref().expect("actual window");
+    assert_eq!(
+        window_diagnostic(Some(required), actual),
+        "bevy-feedback window: required_logical=1280x720 actual_logical=955x1170 actual_physical=1910x2340 scale_factor=2"
+    );
+    let json = serde_json::to_value(&summary).expect("summary JSON");
+    assert_eq!(json["window"]["required_logical"]["width"], 1280);
+    assert_eq!(json["window"]["required_logical"]["height"], 720);
+    assert_actual_dimensions(&json);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn actual_dimensions_are_reported_without_enforcement() {
+    let (root, args, mut summary, server) = window_fixture(None);
+
+    assert!(
+        inspect_window(&args, &root.join("transcript.jsonl"), &mut summary).is_ok(),
+        "observation without requirement"
+    );
+    server.join().expect("server");
+
+    let actual = summary.window.actual.as_ref().expect("actual window");
+    assert_eq!(
+        window_diagnostic(None, actual),
+        "bevy-feedback window: required_logical=none actual_logical=955x1170 actual_physical=1910x2340 scale_factor=2"
+    );
+    let json = serde_json::to_value(&summary).expect("summary JSON");
+    assert_eq!(json["window"]["required_logical"], Value::Null);
+    assert_actual_dimensions(&json);
+    let _ = fs::remove_dir_all(root);
+}
+
+fn assert_actual_dimensions(json: &Value) {
+    assert_eq!(json["window"]["actual"]["logical_width"], 955.0);
+    assert_eq!(json["window"]["actual"]["logical_height"], 1170.0);
+    assert_eq!(json["window"]["actual"]["physical_width"], 1910);
+    assert_eq!(json["window"]["actual"]["physical_height"], 2340);
+    assert_eq!(json["window"]["actual"]["scale_factor"], 2.0);
+}
+
+fn window_fixture(
+    required_window_size: Option<RequiredWindowSize>,
+) -> (PathBuf, RunArgs, RunSummary, thread::JoinHandle<()>) {
     let root = std::env::temp_dir().join(format!(
         "bevy-feedback-window-contract-{}-{}",
         std::process::id(),
@@ -39,14 +98,10 @@ fn mismatch_is_stable_and_records_required_and_actual_dimensions() {
     )
     .expect("protocol");
     let server = thread::spawn(move || serve_window_info(listener));
-    let required = RequiredWindowSize {
-        width: 1280,
-        height: 720,
-    };
     let args = RunArgs {
         protocol_file,
         artifacts: root.clone(),
-        required_window_size: Some(required),
+        required_window_size,
         prepare_timeout: Duration::from_secs(1),
         protocol_timeout: Duration::from_secs(1),
         shutdown_timeout: Duration::from_secs(1),
@@ -57,38 +112,8 @@ fn mismatch_is_stable_and_records_required_and_actual_dimensions() {
         driver: None,
         used_legacy_ready_timeout: false,
     };
-    let mut summary = empty_summary(&root, required);
-
-    let failure = inspect_window_contract(
-        &args,
-        &root.join("transcript.jsonl"),
-        required,
-        &mut summary,
-    )
-    .expect_err("window must mismatch");
-    server.join().expect("server");
-
-    assert_eq!(failure.code, "window_size_mismatch");
-    assert_eq!(
-        failure.message,
-        "required logical window 1280x720, observed 955x1170"
-    );
-    assert_eq!(
-        window_diagnostic(
-            required,
-            summary.window.actual.as_ref().expect("actual window")
-        ),
-        "bevy-feedback window: required_logical=1280x720 actual_logical=955x1170 actual_physical=1910x2340 scale_factor=2"
-    );
-    let json = serde_json::to_value(&summary).expect("summary JSON");
-    assert_eq!(json["window"]["required_logical"]["width"], 1280);
-    assert_eq!(json["window"]["required_logical"]["height"], 720);
-    assert_eq!(json["window"]["actual"]["logical_width"], 955.0);
-    assert_eq!(json["window"]["actual"]["logical_height"], 1170.0);
-    assert_eq!(json["window"]["actual"]["physical_width"], 1910);
-    assert_eq!(json["window"]["actual"]["physical_height"], 2340);
-    assert_eq!(json["window"]["actual"]["scale_factor"], 2.0);
-    let _ = fs::remove_dir_all(root);
+    let summary = empty_summary(&root, required_window_size);
+    (root, args, summary, server)
 }
 
 fn serve_window_info(listener: TcpListener) {
@@ -124,7 +149,7 @@ fn serve_window_info(listener: TcpListener) {
     .expect("response");
 }
 
-fn empty_summary(root: &Path, required: RequiredWindowSize) -> RunSummary {
+fn empty_summary(root: &Path, required: Option<RequiredWindowSize>) -> RunSummary {
     RunSummary {
         schema_version: 1,
         result: RunResult {
@@ -154,7 +179,7 @@ fn empty_summary(root: &Path, required: RequiredWindowSize) -> RunSummary {
             screenshots: root.join("screenshots"),
         },
         window: WindowSummary {
-            required_logical: Some(required),
+            required_logical: required,
             actual: None,
         },
         process_exit: "not_started",

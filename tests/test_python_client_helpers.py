@@ -192,12 +192,20 @@ class BevyFeedbackClientCoordinateHelpersTest(unittest.TestCase):
 
         self.assertEqual(client.window_center(), (477.5, 585.0))
 
-    def test_point_uses_fractional_logical_dimensions(self) -> None:
+    def test_point_uses_actual_logical_dimensions_after_window_manager_override(self) -> None:
+        requested_size = (1280.0, 720.0)
+        actual_size = (955.0, 1170.0)
         client = BevyFeedbackClient.__new__(BevyFeedbackClient)
         client.window_info = lambda: {
-            "result": {"window": {"logical_width": 955.0, "logical_height": 1170.0}}
+            "result": {
+                "window": {
+                    "logical_width": actual_size[0],
+                    "logical_height": actual_size[1],
+                }
+            }
         }
 
+        self.assertNotEqual(actual_size, requested_size)
         self.assertEqual(client.point(0.95, 0.5), (907.25, 585.0))
 
     def test_point_rejects_out_of_range_fractions(self) -> None:
