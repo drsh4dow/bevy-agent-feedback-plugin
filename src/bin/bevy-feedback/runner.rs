@@ -377,54 +377,15 @@ fn run_lifecycle(
     let driver_started = Instant::now();
     let mut primary_failure = None;
     if let (Some(driver_command), Some(log_path)) = (&args.driver, driver_log_path) {
-        let log_file = Arc::new(Mutex::new(File::create(log_path).map_err(|error| {
-            RunFailure {
-                phase: "driver",
-                code: "driver_log_failed",
-                message: error.to_string(),
-            }
-        })?));
-        let mut driver = spawn_command(
-            "--driver",
+        primary_failure = run_driver(
             driver_command,
+            log_path,
             args,
             &python,
             wrapper_capture_dir,
             transcript_file,
-            None,
         )
-        .map_err(|message| RunFailure {
-            phase: "driver",
-            code: "driver_spawn_failed",
-            message,
-        })?;
-        stream_child_logs(&mut driver, log_file);
-        match wait_child(&mut driver, args.driver_timeout).map_err(|error| RunFailure {
-            phase: "driver",
-            code: "driver_wait_failed",
-            message: error.to_string(),
-        })? {
-            Some(status) if status.success() => {}
-            Some(status) => {
-                primary_failure = Some(RunFailure {
-                    phase: "driver",
-                    code: "driver_nonzero_exit",
-                    message: format!("driver exited with status {status}"),
-                })
-            }
-            None => {
-                let _ = driver.kill();
-                let _ = driver.wait();
-                primary_failure = Some(RunFailure {
-                    phase: "driver",
-                    code: "driver_timeout",
-                    message: format!(
-                        "driver timed out after {} ms",
-                        args.driver_timeout.as_millis()
-                    ),
-                });
-            }
-        }
+        .err();
     } else {
         match wait_game_or_signal(&mut game, &stop).map_err(|error| RunFailure {
             phase: "game",
@@ -515,6 +476,62 @@ fn run_lifecycle(
             .push("game exited cleanly before shutdown acknowledgment".to_string());
     }
     Ok(())
+}
+
+fn run_driver(
+    command: &[String],
+    log_path: &Path,
+    args: &RunArgs,
+    python: &BundledPythonClient,
+    capture_dir: &Path,
+    transcript_file: &Path,
+) -> Result<(), RunFailure> {
+    let log_file = Arc::new(Mutex::new(File::create(log_path).map_err(|error| {
+        RunFailure {
+            phase: "driver",
+            code: "driver_log_failed",
+            message: error.to_string(),
+        }
+    })?));
+    let mut driver = spawn_command(
+        "--driver",
+        command,
+        args,
+        python,
+        capture_dir,
+        transcript_file,
+        None,
+    )
+    .map_err(|message| RunFailure {
+        phase: "driver",
+        code: "driver_spawn_failed",
+        message,
+    })?;
+    stream_child_logs(&mut driver, log_file);
+    match wait_child(&mut driver, args.driver_timeout).map_err(|error| RunFailure {
+        phase: "driver",
+        code: "driver_wait_failed",
+        message: error.to_string(),
+    })? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(RunFailure {
+            phase: "driver",
+            code: "driver_nonzero_exit",
+            message: format!("driver exited with status {status}"),
+        }),
+        None => {
+            let _ = driver.kill();
+            let _ = driver.wait();
+            Err(RunFailure {
+                phase: "driver",
+                code: "driver_timeout",
+                message: format!(
+                    "driver timed out after {} ms",
+                    args.driver_timeout.as_millis()
+                ),
+            })
+        }
+    }
 }
 
 mod process;
