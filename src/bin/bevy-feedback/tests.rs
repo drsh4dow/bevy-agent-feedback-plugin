@@ -351,6 +351,49 @@ fn prepare_failures_are_typed_and_always_write_run_summary() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn live_protocol_timeout_and_game_cwd_are_recorded() {
+    let root = temp_root("live-timeout");
+    let artifacts = root.join("artifacts");
+    let game_cwd = root.join("game-cwd");
+    fs::create_dir_all(&game_cwd).expect("game cwd");
+    let marker = game_cwd.join("cwd.txt");
+    let script = format!("pwd > '{}'; exec sleep 2", marker.display());
+    let args = RunArgs {
+        protocol_file: root.join("protocol.json"),
+        artifacts: artifacts.clone(),
+        prepare_timeout: Duration::from_secs(1),
+        protocol_timeout: Duration::from_millis(50),
+        shutdown_timeout: Duration::from_millis(50),
+        driver_timeout: Duration::from_secs(1),
+        game_cwd: Some(game_cwd.clone()),
+        prepare: None,
+        game: vec!["sh".into(), "-c".into(), script],
+        driver: None,
+        used_legacy_ready_timeout: false,
+    };
+
+    let error = run(args).expect_err("live unready game must time out");
+    let summary: Value =
+        serde_json::from_slice(&fs::read(artifacts.join("run-summary.json")).expect("run summary"))
+            .expect("summary JSON");
+
+    assert!(error.contains("protocol_timeout"), "{error}");
+    assert_eq!(summary["result"]["code"], "protocol_timeout");
+    assert_eq!(summary["phase"], "protocol_startup");
+    assert_eq!(
+        summary["launch"]["game_cwd"],
+        game_cwd.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        fs::read_to_string(marker).expect("cwd marker").trim(),
+        game_cwd.to_string_lossy()
+    );
+    assert_eq!(summary["teardown"]["forced_termination"], true);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn both_cli_failure_paths_write_focused_failure_artifacts() {
     let cases = [
@@ -403,7 +446,19 @@ fn both_cli_failure_paths_write_focused_failure_artifacts() {
         }
         let summary =
             fs::read_to_string(artifacts.join("failure-summary.txt")).expect("failure summary");
+        let run_summary: Value = serde_json::from_slice(
+            &fs::read(artifacts.join("run-summary.json")).expect("run summary"),
+        )
+        .expect("run summary JSON");
 
+        assert_eq!(
+            run_summary["result"]["code"],
+            if scenario == "readiness" {
+                "protocol_early_exit"
+            } else {
+                "game_nonzero_exit"
+            }
+        );
         assert!(summary.contains(original_failure), "{scenario}: {summary}");
         assert!(summary.contains(diagnostic), "{scenario}: {summary}");
         assert!(
